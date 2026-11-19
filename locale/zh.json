@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-spinejit",
+    "description": "面向 DeepSeek Harness 的 Spine 插件，将子任务树编译为结构化上下文，支持长程任务。"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-spinejit",
+    "description": "Spine for DeepSeek Harness — compiles subtask trees into structured context for long-horizon tasks."
+  }
+}

@@ -29,7 +29,9 @@
     "./client": {
       "types": "./dist/client.d.ts",
       "default": "./dist/client.js"
-    }
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "dsh": {
     "bundle": {
@@ -48,8 +50,11 @@
   },
   "files": [
     "README.md",
+    "NOTICE",
     "cordis.patch.yml",
     "screenshots.json",
+    "icon.svg",
+    "locale/*.json",
     "dist"
   ],
   "publishConfig": {
