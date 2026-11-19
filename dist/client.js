@@ -28,147 +28,74 @@ __export(client_exports, {
   inject: () => inject
 });
 module.exports = __toCommonJS(client_exports);
+
+// src/worktree.ts
 var import_jsx_runtime = require("react/jsx-runtime");
 
 // node_modules/@spinejit/spine-sdk/dist/view/tree-style.js
 function spineTreeSpawnOutcome(spawn) {
   return spawn !== null && typeof spawn === "object" ? spawn.arrived : null;
 }
-function spineTreeMarkerTone(marker) {
-  switch (marker) {
-    case "\u25C9":
-    case "\u2713":
-      return "brand";
-    case "\xD7":
-      return "error";
-    case "!":
-      return "warning";
-    default:
-      return "dim";
-  }
-}
-function spineTreeMarker(node, active, hasChildren, expanded = true) {
-  if (active)
-    return "\u25C9";
-  if (node.kind === "RootEpoch")
-    return "\u25CC";
-  const outcome = spineTreeSpawnOutcome(node.spawn);
-  if (outcome === "completed")
-    return "\u2713";
-  if (outcome === "errored")
-    return "\xD7";
-  if (outcome === "aborted")
-    return "!";
-  if (node.spawn === "inherited")
-    return "\u25CC";
-  if (node.kind === "Spawn")
-    return "\u25D0";
-  if (node.status === "Live")
-    return "\u25C9";
-  if (node.status === "Closed")
-    return "\u2713";
-  if (node.status === "Compacted")
-    return "\u25CC";
-  if (node.status === "Opened" && hasChildren)
-    return expanded ? "\u25BE" : "\u25B8";
-  return "\u25CC";
-}
-function spineTreeLabel(node, active) {
-  const summary = node.summary?.trim();
-  if (summary)
-    return summary;
-  if (active || node.status === "Live")
-    return "Current task";
-  if (node.status === "Opened")
-    return "Task";
-  if (node.status === "Closed")
-    return "Completed task";
-  return "Previous task";
-}
-function spineTreeBranch(isLast) {
-  return isLast ? "\u2514 " : "\u251C ";
-}
-function spineTreeChildPrefix(isLast) {
-  return isLast ? "  " : "\u2502 ";
+
+// src/tree.ts
+var TREE_PROJECTION = "spinejit";
+function showsTree(tree) {
+  return tree?.nodes.some((node) => node.kind === "Task") === true;
 }
 
-// node_modules/@spinejit/spine-sdk/dist/view/pretty-tree.js
+// src/worktree.ts
 var PRETTY_MAX_VISIBLE_SIBLINGS = 3;
 var PRETTY_ACTIVE_PARENT_DEPTH = 3;
-function prettySpineTreeLines(activeNodeId, nodes) {
-  const lines = [{ type: "header" }];
-  if (nodes.length === 0) {
-    lines.push({ type: "empty" });
-    return lines;
+function webTreeItems(activeNodeId, nodes) {
+  const byId = /* @__PURE__ */ new Map();
+  const childrenByParent = /* @__PURE__ */ new Map();
+  for (const node of nodes) {
+    byId.set(node.nodeId, node);
+    const siblings = childrenByParent.get(node.parentId);
+    if (siblings) siblings.push(node);
+    else childrenByParent.set(node.parentId, [node]);
   }
-  const byId = new Map(nodes.map((node) => [node.nodeId, node]));
-  if (!byId.has(activeNodeId)) {
-    lines.push({ type: "empty" });
-    return lines;
-  }
-  const viewport = prettyViewport(activeNodeId, nodes, byId);
-  if (viewport.rootNodes.length === 0) {
-    lines.push({ type: "empty" });
-    return lines;
-  }
-  appendPrettyNodes(lines, nodes, activeNodeId, viewport.rootNodes, viewport.activePath, "  ", viewport.earlierBranchCount);
-  return lines;
+  if (!byId.has(activeNodeId)) return [];
+  const { rootNodes, activePath, earlierBranchCount } = prettyViewport(activeNodeId, childrenByParent, byId);
+  return prettyLevel(childrenByParent, activeNodeId, rootNodes, activePath, earlierBranchCount);
 }
-function appendPrettyNodes(lines, nodes, activeNodeId, level, activePath, prefix, leadingHistoryCount) {
-  const items = prependHistory(prettySiblingItems(visibleNodes(nodes, activeNodeId, level), activePath), leadingHistoryCount);
-  items.forEach((item, index) => {
-    const isLast = index + 1 === items.length;
-    const branch = spineTreeBranch(isLast);
-    const childPrefix = `${prefix}${spineTreeChildPrefix(isLast)}`;
-    if (item.type === "history") {
-      lines.push({ type: "history", prefix: `${prefix}${branch}`, count: item.count });
-      return;
-    }
-    const children = childNodes(nodes, item.node.nodeId);
-    const current = item.node.nodeId === activeNodeId;
-    lines.push({
-      type: "node",
-      prefix: `${prefix}${branch}`,
-      marker: spineTreeMarker(item.node, current, children.length > 0),
-      label: spineTreeLabel(item.node, current),
-      current
-    });
-    if (shouldCollapse(item.node, children.length > 0, activePath))
-      return;
-    appendPrettyNodes(lines, nodes, activeNodeId, children, activePath, childPrefix, 0);
+function prettyLevel(childrenByParent, activeNodeId, level, activePath, leadingHistoryCount = 0) {
+  const items = prependHistory(prettySiblingItems(visibleNodes(childrenByParent, activeNodeId, level), activePath), leadingHistoryCount);
+  return items.map((item) => {
+    if (item.type === "history") return item;
+    const children = childrenByParent.get(item.node.nodeId) ?? [];
+    return {
+      ...item,
+      current: item.node.nodeId === activeNodeId,
+      children: shouldCollapse(item.node, children.length > 0, activePath) ? [] : prettyLevel(childrenByParent, activeNodeId, children, activePath)
+    };
   });
 }
-function prettyViewport(activeNodeId, nodes, byId) {
+function prettyViewport(activeNodeId, childrenByParent, byId) {
   const pathNodes = activePathNodes(activeNodeId, byId);
   const activePath = new Set(pathNodes.map((node) => node.nodeId));
   const activeRoot = pathNodes[pathNodes.length - 1];
-  if (activeRoot === void 0) {
-    return { rootNodes: [], earlierBranchCount: 0, activePath };
-  }
-  const activeRootNodes = visibleNodes(nodes, activeNodeId, [activeRoot]);
+  const activeRootNodes = visibleNodes(childrenByParent, activeNodeId, [activeRoot]);
   let earlierBranchCount = 0;
-  for (const node of childNodes(nodes, null)) {
+  for (const node of childrenByParent.get(null) ?? []) {
     if (node.nodeId === activeRoot.nodeId)
       continue;
-    for (const visible of visibleNodes(nodes, activeNodeId, [node])) {
+    for (const visible of visibleNodes(childrenByParent, activeNodeId, [node])) {
       if (isCompleted(visible))
         earlierBranchCount += 1;
     }
   }
   const visibleActivePath = pathNodes.filter((node) => {
-    const children = childNodes(nodes, node.nodeId);
+    const children = childrenByParent.get(node.nodeId) ?? [];
     return !shouldElide(node, children.length > 0, node.nodeId === activeNodeId);
   });
   if (visibleActivePath.length <= PRETTY_ACTIVE_PARENT_DEPTH + 1) {
     return { rootNodes: activeRootNodes, earlierBranchCount, activePath };
   }
   const focusRoot = visibleActivePath[PRETTY_ACTIVE_PARENT_DEPTH];
-  if (focusRoot === void 0) {
-    return { rootNodes: activeRootNodes, earlierBranchCount, activePath };
-  }
   earlierBranchCount += completedOffPathCount(activeRootNodes, activePath);
   for (const ancestor of visibleActivePath.slice(PRETTY_ACTIVE_PARENT_DEPTH + 1)) {
-    const children = visibleNodes(nodes, activeNodeId, childNodes(nodes, ancestor.nodeId));
+    const children = visibleNodes(childrenByParent, activeNodeId, childrenByParent.get(ancestor.nodeId) ?? []);
     earlierBranchCount += completedOffPathCount(children, activePath);
   }
   return { rootNodes: [focusRoot], earlierBranchCount, activePath };
@@ -185,37 +112,34 @@ function prettySiblingItems(nodes, activePath) {
   if (visibleStart > 0) {
     folded.push({
       type: "history",
-      count: items.slice(0, visibleStart).reduce((sum, item) => sum + (item.type === "history" ? item.count : 1), 0)
+      count: visibleStart
     });
   }
   folded.push(...items.slice(visibleStart, visibleEnd));
   return mergeHistory(folded);
 }
-function visibleNodes(nodes, activeNodeId, level) {
+function visibleNodes(childrenByParent, activeNodeId, level) {
   const out = [];
-  appendVisible(nodes, activeNodeId, level, out);
+  appendVisible(childrenByParent, activeNodeId, level, out);
   return out;
 }
-function appendVisible(nodes, activeNodeId, level, out) {
+function appendVisible(childrenByParent, activeNodeId, level, out) {
   for (const node of level) {
-    const children = childNodes(nodes, node.nodeId);
+    const children = childrenByParent.get(node.nodeId) ?? [];
     if (shouldElide(node, children.length > 0, node.nodeId === activeNodeId)) {
-      appendVisible(nodes, activeNodeId, children, out);
+      appendVisible(childrenByParent, activeNodeId, children, out);
     } else {
       out.push(node);
     }
   }
-}
-function childNodes(nodes, parentId) {
-  return nodes.filter((node) => node.parentId === parentId);
 }
 function activePathNodes(activeNodeId, byId) {
   const path = [];
   const seen = /* @__PURE__ */ new Set();
   let current = byId.get(activeNodeId);
   while (current !== void 0) {
-    if (!seen.add(current.nodeId))
-      break;
+    if (seen.has(current.nodeId)) break;
+    seen.add(current.nodeId);
     path.push(current);
     current = current.parentId === null ? void 0 : byId.get(current.parentId);
   }
@@ -259,32 +183,378 @@ function mergeHistory(items) {
   return merged;
 }
 function trimmedSummary(node) {
-  const summary = node.summary?.trim();
-  return summary === void 0 || summary === "" ? null : summary;
+  return node.summary?.trim() || null;
 }
-function historyNoun(count) {
-  return count === 1 ? "branch" : "branches";
+var ICON_PATHS = {
+  sitemap: [
+    "M3 15m0 2a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z",
+    "M15 15m0 2a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z",
+    "M9 3m0 2a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v2a2 2 0 0 1 -2 2h-2a2 2 0 0 1 -2 -2z",
+    "M6 15v-1a2 2 0 0 1 2 -2h8a2 2 0 0 1 2 2v1",
+    "M12 9l0 3"
+  ],
+  history: ["M12 8l0 4l2 2", "M3.05 11a9 9 0 1 1 .5 4m-.5 5v-5h5"],
+  check: ["M5 12l5 5l10 -10"],
+  x: ["M18 6l-12 12", "M6 6l12 12"],
+  "exclamation-mark": ["M12 19v.01", "M12 15v-10"]
+};
+function renderIcon(name, size) {
+  return (0, import_jsx_runtime.jsx)("svg", {
+    width: size,
+    height: size,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round",
+    strokeLinejoin: "round",
+    focusable: "false",
+    "aria-hidden": true,
+    children: ICON_PATHS[name].map((d) => (0, import_jsx_runtime.jsx)("path", { d }, d))
+  });
 }
-function prettySpineTreeLineText(line) {
-  switch (line.type) {
-    case "header":
-      return "\u2022 Spine Tree";
-    case "empty":
-      return "  \u2514 (empty)";
-    case "history":
-      return `${line.prefix}\u25CC ${line.count} earlier ${historyNoun(line.count)}`;
-    case "node":
-      return `${line.prefix}${line.marker} ${line.label}`;
+function renderDisclosureIcon() {
+  return (0, import_jsx_runtime.jsx)("svg", {
+    width: 14,
+    height: 14,
+    viewBox: "0 0 16 16",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 1,
+    focusable: "false",
+    "aria-hidden": true,
+    children: (0, import_jsx_runtime.jsx)("path", { d: "M4 6l3.3 3.3q.7.7 1.4 0L12 6" })
+  });
+}
+function renderStateMark(mark) {
+  if (mark === "history") return renderIcon("history", 12);
+  if (mark === "complete") return renderIcon("check", 14);
+  if (mark === "error") return renderIcon("x", 14);
+  if (mark === "aborted") return renderIcon("exclamation-mark", 14);
+  if (mark === "task") {
+    return (0, import_jsx_runtime.jsx)("span", { className: "spine-dot", "aria-hidden": true });
   }
+  return (0, import_jsx_runtime.jsxs)("svg", {
+    className: "spine-spinner",
+    width: 14,
+    height: 14,
+    viewBox: "0 0 24 24",
+    fill: "none",
+    stroke: "currentColor",
+    strokeWidth: 2,
+    strokeLinecap: "round",
+    focusable: "false",
+    "aria-hidden": true,
+    children: [
+      (0, import_jsx_runtime.jsx)("circle", { cx: 12, cy: 12, r: 9.5, opacity: 0.25 }),
+      (0, import_jsx_runtime.jsx)("circle", { cx: 12, cy: 12, r: 9.5, className: "spine-spinner-arc" })
+    ]
+  });
 }
-
-// src/tree.ts
-var TREE_PROJECTION = "spinejit";
-function showsTree(tree) {
-  return tree?.nodes.some((node) => node.kind === "Task") === true;
+var worktreeText = {
+  zh: {
+    title: "\u5DE5\u4F5C\u6811",
+    current: "\u5F53\u524D",
+    parallel: "\u5E76\u884C",
+    complete: "\u5DF2\u5B8C\u6210",
+    error: "\u5931\u8D25",
+    aborted: "\u4E2D\u6B62",
+    task: "\u4EFB\u52A1",
+    currentTask: "\u5F53\u524D\u4EFB\u52A1",
+    completedTask: "\u5DF2\u5B8C\u6210\u4EFB\u52A1",
+    previousTask: "\u8F83\u65E9\u4EFB\u52A1",
+    parallelOne: "1 \u4E2A\u5E76\u884C\u5206\u652F",
+    parallelMany: "{count} \u4E2A\u5E76\u884C\u5206\u652F",
+    earlierOne: "1 \u4E2A\u8F83\u65E9\u5206\u652F",
+    earlierMany: "{count} \u4E2A\u8F83\u65E9\u5206\u652F"
+  },
+  en: {
+    title: "Task tree",
+    current: "Current",
+    parallel: "Parallel",
+    complete: "Completed",
+    error: "Failed",
+    aborted: "Aborted",
+    task: "Task",
+    currentTask: "Current task",
+    completedTask: "Completed task",
+    previousTask: "Previous task",
+    parallelOne: "1 parallel branch",
+    parallelMany: "{count} parallel branches",
+    earlierOne: "1 earlier branch",
+    earlierMany: "{count} earlier branches"
+  }
+};
+var CSS = `
+.spinejit-worktree {
+  box-sizing: border-box;
+  flex: none;
+  min-width: 0;
+  width: calc(100% - 2 * var(--dsh-composer-side-clearance) - 4 * var(--dsh-composer-dock-inset));
+  max-width: calc(var(--dsh-composer-card-max-width) - 4 * var(--dsh-composer-dock-inset));
+  margin: 0 auto;
+  border: 0;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-specific-menu);
+  backdrop-filter: var(--dsw-menu-backdrop-filter);
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
+  box-shadow: var(--dsw-elevation-panel);
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+}
+.spinejit-worktree .spine-header {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 6px 12px;
+  list-style: none;
+  font: var(--dsw-font-xs-13);
+  cursor: pointer;
+}
+.spinejit-worktree .spine-header::-webkit-details-marker { display: none; }
+.spinejit-worktree .spine-header:focus-visible {
+  outline: var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: calc(-1 * var(--dsw-focus-ring-width));
+  border-radius: inherit;
+}
+.spinejit-worktree .spine-title { flex: none; font: var(--dsw-font-xs-strong-13); }
+.spinejit-worktree .spine-summary {
+  display: flex;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary);
+  white-space: nowrap;
+}
+.spinejit-worktree .spine-summary-task {
+  color: var(--dsw-alias-label-primary-dimmed);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.spinejit-worktree .spine-summary-status { flex: none; }
+.spinejit-worktree .spine-icon {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+}
+.spinejit-worktree .spine-icon svg { stroke-width: 1.5; }
+.spinejit-worktree .spine-chevron {
+  display: grid;
+  place-items: center;
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  margin-inline-start: auto;
+}
+.spinejit-worktree:not([open]) .spine-chevron svg { transform: rotate(180deg); }
+/* Together with the header's lower padding, this leaves 8px before the tree. */
+.spinejit-worktree .spine-body { padding: 2px 12px 6px; }
+.spinejit-worktree .spine-tree {
+  --spine-item-gap: 8px;
+  --spine-indent: 18px;
+  --spine-marker-size: 16px;
+  max-block-size: 180px;
+  overflow: auto;
+}
+.spinejit-worktree ul {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spine-item-gap);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.spinejit-worktree .spine-branches {
+  margin-block-start: var(--spine-item-gap);
+  padding-inline-start: var(--spine-indent);
+}
+.spinejit-worktree .spine-branches > li { --spine-connector-start: 0px; }
+.spinejit-worktree .spine-branches > li:first-child {
+  --spine-connector-start: calc(-1 * var(--spine-item-gap));
+}
+.spinejit-worktree .spine-branches > li:not(:last-child) { position: relative; }
+.spinejit-worktree .spine-branches > li:not(:last-child)::before,
+.spinejit-worktree .spine-branches > li:last-child > .spine-row::before,
+.spinejit-worktree .spine-branches > li > .spine-row::after {
+  content: "";
+  position: absolute;
+  /* Center the 1px stroke under the parent marker, whatever the child indent. */
+  inset-inline-start: calc(var(--spine-marker-size) / 2 - var(--spine-indent) - 0.5px);
+  background: var(--dsw-alias-border-l2);
+}
+.spinejit-worktree .spine-branches > li:not(:last-child)::before {
+  inset-block: var(--spine-connector-start) calc(-1 * var(--spine-item-gap));
+  width: 1px;
+}
+.spinejit-worktree .spine-branches > li:last-child > .spine-row::before {
+  inset-block: var(--spine-connector-start) 50%;
+  width: 1px;
+}
+.spinejit-worktree .spine-branches > li > .spine-row::after {
+  inset-block-start: calc(50% - 0.5px);
+  /* Leave more space between the hook and the child icon. */
+  width: calc((var(--spine-indent) - var(--spine-marker-size) / 2 - 0.5px) * 0.9);
+  height: 1px;
+}
+.spinejit-worktree .spine-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--spine-marker-size) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font: var(--dsw-font-xs-13);
+  color: var(--dsw-alias-label-secondary);
+}
+.spinejit-worktree .spine-row-title { overflow-wrap: anywhere; }
+.spinejit-worktree .spine-mark {
+  display: grid;
+  place-items: center;
+  height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+}
+/* Match the shared DSH status indicators using the theme's state colors. */
+.spinejit-worktree .spine-mark-task { color: var(--dsw-alias-state-idle-primary); }
+.spinejit-worktree .spine-mark-parallel { color: var(--dsw-alias-state-done-primary); }
+.spinejit-worktree .spine-mark-complete { color: var(--dsw-alias-state-success-primary); }
+.spinejit-worktree .spine-mark-error { color: var(--dsw-alias-state-error-primary); }
+.spinejit-worktree .spine-mark-aborted { color: var(--dsw-alias-state-warn-primary); }
+.spinejit-worktree .spine-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.spinejit-worktree .spine-spinner { animation: spinejit-rotate 1.5s linear infinite; }
+.spinejit-worktree .spine-spinner-arc {
+  stroke-dasharray: 12 60;
+  animation: spinejit-dash 1.5s ease-in-out infinite;
+}
+@keyframes spinejit-rotate { to { transform: rotate(360deg); } }
+@keyframes spinejit-dash {
+  0%, 100% { stroke-dasharray: 12 60; stroke-dashoffset: 0; }
+  50% { stroke-dasharray: 24 60; stroke-dashoffset: -6; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinejit-worktree .spine-spinner, .spinejit-worktree .spine-spinner-arc { animation: none; }
+  .spinejit-worktree .spine-spinner-arc { stroke-dasharray: 18 60; stroke-dashoffset: -3; }
+}
+.spinejit-worktree .spine-history { font-size: var(--dsw-font-xxs-12-font-size); }
+.spinejit-worktree .spine-history .spine-mark { color: inherit; }
+`;
+function branchLabel(node, t) {
+  const summary = trimmedSummary(node);
+  if (summary) return summary;
+  if (node.status === "Live") return t("currentTask");
+  if (node.status === "Closed" && node.kind === "Task") return t("completedTask");
+  if (node.status === "Compacted" || node.spawn === "inherited") return t("previousTask");
+  return t("task");
+}
+function branchState(node) {
+  if (node.kind === "Spawn") {
+    if (node.spawn === "pending") return "parallel";
+    switch (spineTreeSpawnOutcome(node.spawn)) {
+      case "completed":
+        return "complete";
+      case "errored":
+        return "error";
+      case "aborted":
+        return "aborted";
+      default:
+        return "history";
+    }
+  }
+  if (node.status === "Closed") return "complete";
+  if (node.status === "Compacted") return "history";
+  return "task";
+}
+function countLabel(t, key, count) {
+  return t(`${key}${count === 1 ? "One" : "Many"}`, { count });
+}
+function countVisibleParallel(items) {
+  let count = 0;
+  for (const item of items) {
+    if (item.type === "history") continue;
+    if (branchState(item.node) === "parallel") count += 1;
+    count += countVisibleParallel(item.children);
+  }
+  return count;
+}
+function treeSummary(tree, items, t) {
+  const current = tree.nodes.find((node) => node.nodeId === tree.cursor && node.kind !== "RootEpoch");
+  const parallelCount = countVisibleParallel(items);
+  return {
+    title: current ? branchLabel(current, t) : null,
+    parallel: parallelCount ? countLabel(t, "parallel", parallelCount) : null
+  };
+}
+function renderSummary({ title, parallel }) {
+  if (!title && !parallel) return null;
+  return (0, import_jsx_runtime.jsxs)("span", { className: "spine-summary", children: [
+    title && (0, import_jsx_runtime.jsx)("span", { className: "spine-summary-task", title, children: title }),
+    parallel && (0, import_jsx_runtime.jsx)("span", { className: "spine-summary-status", children: `${title ? "\u2002\xB7\u2002" : ""}${parallel}` })
+  ] });
+}
+function renderRows(items, t, nested = false) {
+  return (0, import_jsx_runtime.jsx)("ul", {
+    className: nested ? "spine-branches" : void 0,
+    role: "list",
+    children: items.map((item, index) => {
+      if (item.type === "history") {
+        return (0, import_jsx_runtime.jsx)("li", { children: (0, import_jsx_runtime.jsxs)("div", { className: "spine-row spine-history", children: [
+          (0, import_jsx_runtime.jsx)("span", { className: "spine-mark spine-mark-history", "aria-hidden": true, children: renderStateMark("history") }),
+          (0, import_jsx_runtime.jsx)("span", { className: "spine-row-title", children: countLabel(t, "earlier", item.count) })
+        ] }) }, `history-${index}`);
+      }
+      const state = branchState(item.node);
+      const mark = item.current && state === "task" ? "current" : state;
+      const status = mark === "task" ? void 0 : t(mark === "history" ? "previousTask" : mark);
+      return (0, import_jsx_runtime.jsxs)("li", { children: [
+        (0, import_jsx_runtime.jsxs)("div", { className: "spine-row", "aria-current": item.current || void 0, children: [
+          (0, import_jsx_runtime.jsx)("span", {
+            className: `spine-mark spine-mark-${mark}`,
+            role: status ? "img" : void 0,
+            "aria-label": status,
+            "aria-hidden": status ? void 0 : true,
+            title: status,
+            children: renderStateMark(mark)
+          }),
+          (0, import_jsx_runtime.jsx)("span", {
+            className: "spine-row-title",
+            children: branchLabel(item.node, t)
+          })
+        ] }),
+        item.children.length > 0 && renderRows(item.children, t, true)
+      ] }, `branch-${item.node.nodeId}`);
+    })
+  });
+}
+function SpineDock({ useProjection, t }) {
+  const tree = useProjection(TREE_PROJECTION);
+  if (!showsTree(tree)) return null;
+  const items = webTreeItems(tree.cursor, tree.nodes);
+  if (!items.length) return null;
+  return (0, import_jsx_runtime.jsxs)("details", { className: "spinejit-worktree", children: [
+    (0, import_jsx_runtime.jsxs)("summary", { className: "spine-header", children: [
+      (0, import_jsx_runtime.jsx)("span", { className: "spine-icon", "aria-hidden": true, children: renderIcon("sitemap", 14) }),
+      (0, import_jsx_runtime.jsx)("span", { className: "spine-title", children: t("title") }),
+      renderSummary(treeSummary(tree, items, t)),
+      (0, import_jsx_runtime.jsx)("span", { className: "spine-chevron", "aria-hidden": true, children: renderDisclosureIcon() })
+    ] }),
+    (0, import_jsx_runtime.jsx)("style", { children: CSS }),
+    (0, import_jsx_runtime.jsx)("div", { className: "spine-body", children: (0, import_jsx_runtime.jsx)("div", {
+      className: "spine-tree",
+      children: renderRows(items, t)
+    }) })
+  ] });
 }
 
 // src/client.ts
+var LOCALE = "spinejit";
 var emptySpineContextDefinition = {
   kind: "spinejit.empty-context",
   target: "chat",
@@ -299,57 +569,43 @@ var emptySpineContextDefinition = {
   update: () => null,
   buildViewNode: () => null
 };
-var inject = ["slots", "uiConversation"];
+var inject = ["slots", "uiConversation", "locale"];
 function apply(ctx) {
+  ctx.effect(() => ctx.locale.register(LOCALE, worktreeText), "spinejit: work tree locale");
   ctx.effect(() => ctx.uiConversation.events.register(emptySpineContextDefinition), "spinejit: hide empty context");
   ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
     name: "conversation.input.dock",
-    // After the official entries: todo 0, goal 10, activity 15, queue 20.
+    // Between the official Goal (10) and queue (20) entries.
     id: "spinejit",
-    order: 30,
+    order: 19,
+    locale: LOCALE,
     registrant: "@spinejit/dsh-spinejit"
   }, SpineDock));
 }
-var BLOCK = {
-  boxSizing: "border-box",
-  width: "100%",
-  maxWidth: "var(--dsh-composer-card-max-width)",
-  margin: "0 auto",
-  padding: "4px 16px 0",
-  fontFamily: "var(--dsw-font-mono, monospace)",
-  fontSize: 12,
-  lineHeight: "18px",
-  color: "var(--dsw-alias-label-secondary)"
-};
-var ROW = { whiteSpace: "pre", overflow: "hidden", textOverflow: "ellipsis" };
-var DIM = { color: "var(--dsw-alias-label-tertiary)" };
-var TONE = {
-  brand: { color: "var(--dsw-alias-state-success-primary)", fontWeight: 600 },
-  error: { color: "var(--dsw-alias-state-error-primary)", fontWeight: 600 },
-  warning: { color: "var(--dsw-alias-state-warn-primary)", fontWeight: 600 },
-  dim: DIM
-};
-function SpineDock({ useProjection }) {
-  const tree = useProjection(TREE_PROJECTION);
-  if (!showsTree(tree)) return null;
-  return (0, import_jsx_runtime.jsx)("div", {
-    style: BLOCK,
-    children: prettySpineTreeLines(tree.cursor, tree.nodes).map((line, index) => (0, import_jsx_runtime.jsxs)("div", { style: ROW, children: rowParts(line) }, index))
-  });
-}
-function rowParts(line) {
-  switch (line.type) {
-    case "header":
-      return [span(DIM, "\u2022 "), span(TONE.brand, "Spine Tree")];
-    case "node":
-      return [span(DIM, line.prefix), span(TONE[spineTreeMarkerTone(line.marker)], line.marker), ` ${line.label}`];
-    default:
-      return [span(DIM, prettySpineTreeLineText(line))];
-  }
-}
-function span(style, text) {
-  return (0, import_jsx_runtime.jsx)("span", { style, children: text });
-}
+/*!
+ * Tabler Icons v3.31.0 (https://github.com/tabler/tabler-icons/tree/v3.31.0/icons/outline)
+ * MIT License
+ *
+ * Copyright (c) 2020-2024 Paweł Kuna
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
 return module.exports;
 } });
 //# sourceMappingURL=client.js.map

@@ -1,9 +1,6 @@
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
-import { TREE_PROJECTION, type SpineTree } from "./tree.js";
-/** The dock seat's props the entry reads. */
-export interface SpineDockProps {
-    useProjection(key: typeof TREE_PROJECTION): SpineTree | null | undefined;
-}
+import { worktreeText, type SpineDockProps } from "./worktree.js";
+export { SpineDock, type SpineDockProps } from "./worktree.js";
 /** The part of the client's slot service the entry uses. */
 interface Slots {
     inject(name: "conversation.input.dock", register: () => unknown): unknown;
@@ -11,6 +8,7 @@ interface Slots {
         name: "conversation.input.dock";
         id: string;
         order: number;
+        locale: string;
         registrant: string;
     }, component: (props: SpineDockProps) => unknown): unknown;
 }
@@ -37,9 +35,9 @@ export declare function apply(ctx: {
             register(definition: typeof emptySpineContextDefinition): () => void;
         };
     };
+    locale: {
+        register(namespace: string, dictionaries: typeof worktreeText): () => void;
+    };
     effect(execute: () => () => void, label?: string): unknown;
 }): void;
-/** Hook-free but for `useProjection`, so the dock can also call it as a plain function. */
-export declare function SpineDock({ useProjection }: SpineDockProps): unknown;
-export {};
 //# sourceMappingURL=client.d.ts.map
