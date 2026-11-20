@@ -12,6 +12,7 @@ import {
   type SpineTreeMarkerTone,
 } from "@spinejit/spine-sdk/view";
 
+import { compactStatsDefinition } from "./compact-stats.js";
 import { showsTree, TREE_PROJECTION, type SpineTree } from "./tree.js";
 
 type Style = Record<string, string | number>;
@@ -52,10 +53,15 @@ export const inject = ["slots", "uiConversation"];
 
 export function apply(ctx: {
   slots: Slots;
-  uiConversation: { events: { register(definition: typeof emptySpineContextDefinition): () => void } };
+  uiConversation: {
+    events: {
+      register(definition: typeof emptySpineContextDefinition | typeof compactStatsDefinition): () => void;
+    };
+  };
   effect(execute: () => () => void, label?: string): unknown;
 }): void {
   ctx.effect(() => ctx.uiConversation.events.register(emptySpineContextDefinition), "spinejit: hide empty context");
+  ctx.effect(() => ctx.uiConversation.events.register(compactStatsDefinition), "spinejit: compact statistics");
   ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
     name: "conversation.input.dock",
     // After the official entries: todo 0, goal 10, activity 15, queue 20.

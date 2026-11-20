@@ -1,6 +1,6 @@
-import { type DeveloperMessage, type Message, type UserMessage } from "@deepseek-ai/dsh-llm";
+import { type DeveloperMessage, type Message, type TokenUsage, type UserMessage } from "@deepseek-ai/dsh-llm";
 import { type SessionEvent } from "@deepseek-ai/dsh-session";
-import type { SourceCharacter, SpawnArrival } from "@spinejit/spine-sdk";
+import type { CompactBarrier, SourceCharacter, SpawnArrival } from "@spinejit/spine-sdk";
 declare module "@deepseek-ai/dsh-llm" {
     interface MessageSourceMap {
         /**
@@ -16,7 +16,21 @@ declare module "@deepseek-ai/dsh-llm" {
             kind: "spine-arrival";
             arrival: SpawnArrival;
         };
+        "spine-compact": {
+            kind: "spine-compact";
+            barrier: CompactBarrier;
+            calls?: CompactCall[];
+        };
     }
+}
+export interface CompactCall {
+    provider: string;
+    model: string;
+    usage?: TokenUsage;
+}
+export interface CompactSummary {
+    text: string;
+    calls: CompactCall[];
 }
 /**
  * How one surface event takes part in Spine context.
@@ -51,6 +65,9 @@ export declare function endsSampling(event: SessionEvent): boolean;
 export declare function arrivalMessage(arrival: SpawnArrival): UserMessage;
 /** The arrival a logged message carries, or null. */
 export declare function arrivalOf(event: SessionEvent): SpawnArrival | null;
+/** One durable event holds both the epoch barrier and its model-visible replacement. */
+export declare function compactMessage(barrier: CompactBarrier, summary: CompactSummary): UserMessage;
+export declare function compactBarrierOf(event: SessionEvent): CompactBarrier | undefined;
 /** A Spine item (node descriptor, memory, birth) as a model-visible user message. */
 export declare function spineMessage(text: string): UserMessage;
 /** The visible text of a message this plugin wrote; null for an empty slot. */

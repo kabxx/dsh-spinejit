@@ -1,7 +1,9 @@
+import type { Message } from "@deepseek-ai/dsh-llm";
 import type { Agent } from "@deepseek-ai/dsh-agent";
-import { type SessionEvent } from "@deepseek-ai/dsh-session";
+import { SessionSeq, type SessionEvent } from "@deepseek-ai/dsh-session";
 import type { FeatureFlag, SpineProjection } from "@spinejit/spine-sdk";
 import { type SpawnBirth, type SpineToolName } from "@spinejit/spine-sdk/host";
+import { SpineDshError, type CompactSummary } from "./events.js";
 export declare const SPINE_FEATURES: FeatureFlag[];
 /**
  * Hands over the births a live commit made and where their sampling began in
@@ -17,6 +19,13 @@ export type ProjectionHandler = (projection: SpineProjection) => void;
  */
 export declare class SpineToolLimitError extends Error {
     constructor(staged: SpineToolName);
+}
+export declare class SpineCompactCommitError extends SpineDshError {
+}
+export declare const SPINE_ATTACHMENT = "spinejitAttachment";
+export interface SpineAttachment {
+    ensure(agent: Agent): Promise<SpineAgent>;
+    readonly signal: AbortSignal;
 }
 /**
  * The Spine state of one DSH agent. One main-loop model request is one Spine
@@ -53,6 +62,11 @@ export declare class SpineAgent {
     admit(name: SpineToolName, args: Record<string, unknown>): string;
     /** Settle the open sampling, if any, over its stretch of the log so far. */
     settle(): Promise<void>;
+    /** Run under DSH's idle maintenance lock so input cannot start a turn mid-checkpoint. */
+    compact(summarize: (messages: readonly Message[]) => Promise<CompactSummary>, flush: () => Promise<void>, signal: AbortSignal): Promise<{
+        seq: SessionSeq;
+        summary: string;
+    } | null>;
     dispose(): void;
 }
 //# sourceMappingURL=agent.d.ts.map

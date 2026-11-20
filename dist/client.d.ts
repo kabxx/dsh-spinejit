@@ -1,4 +1,5 @@
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
+import { compactStatsDefinition } from "./compact-stats.js";
 import { TREE_PROJECTION, type SpineTree } from "./tree.js";
 /** The dock seat's props the entry reads. */
 export interface SpineDockProps {
@@ -34,7 +35,7 @@ export declare function apply(ctx: {
     slots: Slots;
     uiConversation: {
         events: {
-            register(definition: typeof emptySpineContextDefinition): () => void;
+            register(definition: typeof emptySpineContextDefinition | typeof compactStatsDefinition): () => void;
         };
     };
     effect(execute: () => () => void, label?: string): unknown;

@@ -2,6 +2,7 @@ import { createDeveloperMessage, createUserMessage, lastAssistantStreamChunk, } 
 import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session";
 import { spineArrivalText } from "@spinejit/spine-sdk/host";
 import { withoutAnchor } from "./anchors.js";
+import { COMPACT_CHECKPOINT_PREFIX } from "./compact-format.js";
 export class SpineDshError extends Error {
     constructor(message, options) {
         super(message, options);
@@ -90,6 +91,17 @@ export function arrivalOf(event) {
         return null;
     const source = event.data.source;
     return source.kind === "spine-arrival" ? source.arrival : null;
+}
+/** One durable event holds both the epoch barrier and its model-visible replacement. */
+export function compactMessage(barrier, summary) {
+    return createUserMessage({
+        content: [{ type: "text", text: `${COMPACT_CHECKPOINT_PREFIX}${summary.text}` }],
+        source: { kind: "spine-compact", barrier, calls: summary.calls },
+    });
+}
+export function compactBarrierOf(event) {
+    return event.type === "user/message" && event.data.source.kind === "spine-compact"
+        ? event.data.source.barrier : undefined;
 }
 /** A Spine item (node descriptor, memory, birth) as a model-visible user message. */
 export function spineMessage(text) {

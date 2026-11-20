@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-spinejit/compact",
+    "description": "Provide /compact support for SpineJIT, summarizing the conversation and starting a new task tree."
+  }
+}

@@ -179,9 +179,11 @@ test("the client bundle loads in the module loader and draws the whole tree in t
     uiConversation: { events: { register: (definition) => { definitions.push(definition); return () => {}; } } },
     effect: (execute) => execute(),
   });
-  assert.equal(definitions.length, 1);
+  assert.deepEqual(definitions.map(({ kind, target }) => [kind, target]), [
+    ["spinejit.empty-context", "chat"],
+    ["spinejit.compact-stats", "stats"],
+  ]);
   const [emptyContext] = definitions;
-  assert.equal(emptyContext.target, "chat");
   assert.equal(emptyContext.buildViewNode(), null);
   assert.deepEqual(Object.keys(emptyContext.match), ["developer/message"]);
   const match = emptyContext.match["developer/message"];

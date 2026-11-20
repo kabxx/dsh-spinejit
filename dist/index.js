@@ -3,7 +3,7 @@ import { isAgentLoopRequest } from "@deepseek-ai/dsh-llm";
 import { pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { isSpineToolName, loadSpineConfigToml, SpawnChildren, toArrival } from "@spinejit/spine-sdk/host";
 import { createNodeSpineRuntime } from "@spinejit/spine-sdk/node";
-import { SPINE_FEATURES, SpineAgent } from "./agent.js";
+import { SPINE_ATTACHMENT, SPINE_FEATURES, SpineAgent } from "./agent.js";
 import { userAnchorsProjection } from "./anchors.js";
 import { TreeDisplay, treeProjection } from "./display.js";
 import { arrivalMessage, SpineDshError } from "./events.js";
@@ -280,6 +280,7 @@ export function apply(ctx) {
             waitingParents.delete(agent);
         });
     }
+    ctx.reflect.provide(SPINE_ATTACHMENT, { ensure: attachAgent, signal: lifetime.signal });
     ctx.on("agent/created", async ({ agent }) => { await attachAgent(agent); });
     ctx.on("agent/disposed", ({ agent }) => { waitingParents.get(agent)?.abort(); });
     ctx.on("agent/status", ({ agent, status }) => {
