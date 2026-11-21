@@ -148,6 +148,9 @@ test("the client leaves literal [U<n>] lines in user bubbles", async () => {
       userText: { register: () => assert.fail("text-only rules cannot identify a stored anchor") },
       events: { register: () => () => {} },
     },
+    conversation: { blocks: {} },
+    uiSession: { sessionStatus: { getSnapshot: () => new Map() } },
+    locale: { bind: () => () => "Stop generating", register: () => () => {} },
     effect: (execute) => execute(),
   });
 });
@@ -160,23 +163,31 @@ async function loadClient() {
   new Function("window", source)(window);
   const element = (key) => (type, props, elementKey) => ({ type, props, key: elementKey ?? null, kind: key });
   const required = [];
+  const layoutEffects = [];
   const client = loaded.factory((name) => {
     required.push(name);
+    if (name === "react") return {
+      useLayoutEffect: (effect) => layoutEffects.push(effect),
+      useRef: (current) => ({ current }),
+    };
     return { jsx: element("jsx"), jsxs: element("jsxs") };
   });
-  return { id: loaded.id, client, required };
+  return { id: loaded.id, client, required, layoutEffects };
 }
 
 test("the client bundle loads in the module loader and draws the whole tree in the dock", async () => {
   const { id, client, required } = await loadClient();
   assert.equal(id, "@spinejit/dsh-spinejit");
-  assert.deepEqual(required, ["react/jsx-runtime"]);
-  assert.deepEqual(client.inject, ["slots", "uiConversation"]);
+  assert.deepEqual(required, ["react", "react/jsx-runtime"]);
+  assert.deepEqual(client.inject, ["slots", "uiConversation", "conversation", "locale", "uiSession"]);
   const registered = [];
   const definitions = [];
   client.apply({
     slots: { inject: (_name, register) => register(), register: (entry, component) => registered.push([entry, component]) },
     uiConversation: { events: { register: (definition) => { definitions.push(definition); return () => {}; } } },
+    conversation: { blocks: {} },
+    uiSession: { sessionStatus: { getSnapshot: () => new Map() } },
+    locale: { bind: () => () => "Stop generating", register: () => () => {} },
     effect: (execute) => execute(),
   });
   assert.equal(definitions.length, 1);
@@ -192,8 +203,9 @@ test("the client bundle loads in the module loader and draws the whole tree in t
   assert.notEqual(match(developerEvent("spine", [], 13)).id, match(marker).id);
   assert.equal(match(developerEvent("spine", [{ type: "text", text: "branch summary" }])), null);
   assert.equal(match(developerEvent("time-context", [])), null);
-  assert.deepEqual(registered.map(([entry]) => entry), [{ name: "conversation.input.dock", id: "spinejit", order: 30, registrant: "@spinejit/dsh-spinejit" }]);
-  const Dock = registered[0][1];
+  const leaves = registered.filter(([entry]) => entry.name === "conversation.input.dock");
+  assert.deepEqual(leaves.map(([entry]) => entry), [{ name: "conversation.input.dock", id: "spinejit", order: 30, registrant: "@spinejit/dsh-spinejit" }]);
+  const Dock = leaves[0][1];
   assert.equal(Dock({ useProjection: () => undefined }), null);
   assert.equal(Dock({ useProjection: () => ({ cursor: "1", nodes: [node("1", null, null, "Live", "RootEpoch")] }) }), null);
   const keys = [];
@@ -204,4 +216,92 @@ test("the client bundle loads in the module loader and draws the whole tree in t
   const current = dock.props.children[4].props.children[1];
   assert.equal(current.props.children, "◉");
   assert.equal(current.props.style.color, "var(--dsw-alias-state-success-primary)");
+});
+
+test("only Spine spawn sessions restrict the native composer controls", async () => {
+  const { client, layoutEffects } = await loadClient();
+  const registered = [];
+  const locales = new Map();
+  const states = new Map();
+  const storeFor = (id) => {
+    if (!states.has(id)) states.set(id, { block: undefined, listeners: new Set() });
+    const state = states.get(id);
+    return {
+      getSnapshot: () => state.block,
+      subscribe: (listener) => {
+        state.listeners.add(listener);
+        return () => state.listeners.delete(listener);
+      },
+    };
+  };
+  const blocks = {
+    storeFor,
+    set(id, block) {
+      if (storeFor(id).getSnapshot()?.reason === block?.reason) return;
+      const state = states.get(id);
+      state.block = block;
+      for (const listener of state.listeners) listener();
+    },
+  };
+  client.apply({
+    slots: { inject: (_name, register) => register(), register: (entry, component) => registered.push([entry, component]) },
+    uiConversation: { events: { register: () => () => {} } },
+    conversation: { blocks },
+    uiSession: { sessionStatus: { getSnapshot: () => new Map() } },
+    locale: {
+      bind: (namespace) => (key) => {
+        assert.equal(namespace, "conversation");
+        assert.equal(key, "input.stop");
+        return "停止生成";
+      },
+      register: (name, dictionaries) => { locales.set(name, dictionaries); return () => locales.delete(name); },
+    },
+    effect: (execute) => execute(),
+  });
+  assert.ok(registered.every(([entry]) => entry.name !== "conversation.composer"));
+  const [entry, Block] = registered.find(([entry]) => entry.name === "conversation.composer.dock");
+  const zh = locales.get(entry.locale).zh;
+  const address = { mode: "continuable", parentSessionId: "session-parent", childSessionId: "session-parent:spawn:1.2.3" };
+  const mount = (address, sessionId = address?.childSessionId ?? "session-parent") => {
+    const css = Block({ sessionId, useSession: (select) => select({ subagent: address ? { address } : null }), t: key => zh[key] });
+    const shortcut = layoutEffects.pop();
+    const hold = layoutEffects.pop();
+    assert.equal(shortcut(), undefined, "without a running DOM occurrence no keyboard handler is installed");
+    const release = hold();
+    if (release === undefined) assert.equal(css, null);
+    else {
+      assert.equal(css.type, "style");
+      assert.equal(css.props["data-spinejit-child-stop"], "");
+      assert.ok(css.props.children.includes('button[aria-label="\\505c \\6b62 \\751f \\6210 "]:not([data-slot^="conversation.input."] *)'));
+      assert.match(css.props.children, /interactivity: inert; visibility: visible; opacity: 0.4/);
+    }
+    return release;
+  };
+  assert.equal(mount(null), undefined, "parent composer remains available");
+  assert.equal(mount({ ...address, childSessionId: "session-other" }), undefined, "ordinary DSH child");
+  assert.equal(mount({ ...address, parentSessionId: "session-unrelated" }), undefined, "unmatched parent");
+  assert.equal(mount({ ...address, mode: "one-shot" }), undefined, "one-shot child");
+  assert.equal(mount(address, "session-other"), undefined, "address from a different session");
+  assert.equal(states.size, 0);
+
+  const id = address.childSessionId;
+  const first = mount(address);
+  assert.equal(storeFor(id).getSnapshot().reason, "请在父会话发送消息");
+  const second = mount(address);
+  first();
+  assert.equal(storeFor(id).getSnapshot().reason, zh.placeholder, "a second occurrence still holds the block");
+  const nativeBlock = { reason: "Select a model" };
+  blocks.set(id, nativeBlock);
+  assert.equal(storeFor(id).getSnapshot(), nativeBlock, "DSH can show its own block");
+  blocks.set(id, undefined);
+  assert.equal(storeFor(id).getSnapshot().reason, zh.placeholder, "reinstalled when the other block clears");
+  blocks.set(id, nativeBlock);
+  second();
+  assert.equal(storeFor(id).getSnapshot(), nativeBlock, "disposing Spine leaves a different block in place");
+
+  const nested = { ...address, parentSessionId: id, childSessionId: `${id}:spawn:1.4` };
+  const disposeNested = mount(nested);
+  assert.equal(storeFor(nested.childSessionId).getSnapshot().reason, zh.placeholder);
+  disposeNested();
+  assert.equal(storeFor(nested.childSessionId).getSnapshot(), undefined);
 });
