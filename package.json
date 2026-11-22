@@ -49,6 +49,7 @@
     "README.md",
     "cordis.patch.yml",
     "screenshots.json",
+    "vendor/spine-checkpoint",
     "dist"
   ],
   "publishConfig": {

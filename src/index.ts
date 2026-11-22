@@ -47,6 +47,9 @@ export function apply(ctx: Context): void {
   const pendingStopClaims = new Map<Agent, Set<string>>();
   const stepCancellations = new Map<Agent, UserMessage[]>();
   const waitingParents = new Map<Agent, AbortController>();
+  const saving = new Map<Agent, NodeJS.Immediate>();
+  const writing = new Set<Agent>();
+  const checkpointRequested = new Set<Agent>();
   let unloading = false;
   const world: SpineWorld = { ctx, agents, children, idle: new Map(), starting: new Map() };
   ctx.sessions.registerMessageProjection(withoutReasoningProjection);
@@ -160,7 +163,7 @@ export function apply(ctx: Context): void {
           return executeChild(world, agent, birth, peers, prefixEnd, signal, (arrival) => own.arrive(arrival), start);
         });
         await Promise.all(started);
-      }, (projection) => display.update(agent.session, projection));
+      }, (projection) => display.update(agent.session, projection), ctx, lifetime.signal);
       lifetime.signal.throwIfAborted();
       // Events committed while the asynchronous replay was in progress did
       // not reach a live SpineAgent yet.
@@ -206,6 +209,10 @@ export function apply(ctx: Context): void {
   }
 
   function forgetAgent(agent: Agent, spine: SpineAgent | undefined): void {
+    const scheduled = saving.get(agent);
+    if (scheduled !== undefined) clearImmediate(scheduled);
+    saving.delete(agent);
+    checkpointRequested.delete(agent);
     agents.delete(agent.id);
     children.delete(agent.id);
     disposers.delete(agent);
@@ -284,8 +291,37 @@ export function apply(ctx: Context): void {
     });
   }
 
-  ctx.on("agent/created", async ({ agent }) => { await attachAgent(agent); });
-  ctx.on("agent/disposed", ({ agent }) => { waitingParents.get(agent)?.abort(); });
+  function scheduleCheckpoint(agent: Agent, spine: SpineAgent): void {
+    if (unloading || saving.has(agent) || agent.status !== "idle") return;
+    if (writing.has(agent)) {
+      checkpointRequested.add(agent);
+      return;
+    }
+    const scheduled = setImmediate(() => {
+      saving.delete(agent);
+      if (unloading || agents.get(agent.id) !== spine || agent.status !== "idle") return;
+      writing.add(agent);
+      void agent.whenIdle().then(() => spine.saveCheckpoint(configToml, lifetime.signal)).catch((error: unknown) => {
+        if (!lifetime.signal.aborted) ctx.logger.debug("Spine checkpoint skipped: %s", String(error));
+      }).finally(() => {
+        writing.delete(agent);
+        if (checkpointRequested.delete(agent)) scheduleCheckpoint(agent, spine);
+      });
+    });
+    saving.set(agent, scheduled);
+  }
+
+  ctx.on("agent/created", async ({ agent }) => {
+    const spine = await attachAgent(agent);
+    scheduleCheckpoint(agent, spine);
+  });
+  ctx.on("agent/disposed", ({ agent }) => {
+    waitingParents.get(agent)?.abort();
+    const scheduled = saving.get(agent);
+    if (scheduled !== undefined) clearImmediate(scheduled);
+    saving.delete(agent);
+    checkpointRequested.delete(agent);
+  });
   ctx.on("agent/status", ({ agent, status }) => {
     if (status !== "idle") return;
     const spine = agents.get(agent.id);
@@ -310,6 +346,7 @@ export function apply(ctx: Context): void {
     }
     own.settle(open, aborted || (claimed?.size ?? 0) > 0 || (stopClaims?.size ?? 0) > 0);
     world.idle.get(agent.id)?.settle(aborted);
+    scheduleCheckpoint(agent, spine);
   });
   ctx.on("agent/pre-step", async (payload, next) => {
     // Existing agents do not emit agent/created again after a plugin reload.
@@ -368,6 +405,9 @@ export function apply(ctx: Context): void {
   ctx.effect(() => () => {
     unloading = true;
     lifetime.abort(new SpineDshError("Spine is reloading; retry this turn once it is ready"));
+    for (const scheduled of saving.values()) clearImmediate(scheduled);
+    saving.clear();
+    checkpointRequested.clear();
     for (const wait of waitingParents.values()) wait.abort();
     waitingParents.clear();
     // A tool in an active turn can initiate the reload and wait for it.

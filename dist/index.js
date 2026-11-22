@@ -37,6 +37,9 @@ export function apply(ctx) {
     const pendingStopClaims = new Map();
     const stepCancellations = new Map();
     const waitingParents = new Map();
+    const saving = new Map();
+    const writing = new Set();
+    const checkpointRequested = new Set();
     let unloading = false;
     const world = { ctx, agents, children, idle: new Map(), starting: new Map() };
     ctx.sessions.registerMessageProjection(withoutReasoningProjection);
@@ -150,7 +153,7 @@ export function apply(ctx) {
                     return executeChild(world, agent, birth, peers, prefixEnd, signal, (arrival) => own.arrive(arrival), start);
                 });
                 await Promise.all(started);
-            }, (projection) => display.update(agent.session, projection));
+            }, (projection) => display.update(agent.session, projection), ctx, lifetime.signal);
             lifetime.signal.throwIfAborted();
             // Events committed while the asynchronous replay was in progress did
             // not reach a live SpineAgent yet.
@@ -201,6 +204,11 @@ export function apply(ctx) {
         }
     }
     function forgetAgent(agent, spine) {
+        const scheduled = saving.get(agent);
+        if (scheduled !== undefined)
+            clearImmediate(scheduled);
+        saving.delete(agent);
+        checkpointRequested.delete(agent);
         agents.delete(agent.id);
         children.delete(agent.id);
         disposers.delete(agent);
@@ -280,8 +288,41 @@ export function apply(ctx) {
             waitingParents.delete(agent);
         });
     }
-    ctx.on("agent/created", async ({ agent }) => { await attachAgent(agent); });
-    ctx.on("agent/disposed", ({ agent }) => { waitingParents.get(agent)?.abort(); });
+    function scheduleCheckpoint(agent, spine) {
+        if (unloading || saving.has(agent) || agent.status !== "idle")
+            return;
+        if (writing.has(agent)) {
+            checkpointRequested.add(agent);
+            return;
+        }
+        const scheduled = setImmediate(() => {
+            saving.delete(agent);
+            if (unloading || agents.get(agent.id) !== spine || agent.status !== "idle")
+                return;
+            writing.add(agent);
+            void agent.whenIdle().then(() => spine.saveCheckpoint(configToml, lifetime.signal)).catch((error) => {
+                if (!lifetime.signal.aborted)
+                    ctx.logger.debug("Spine checkpoint skipped: %s", String(error));
+            }).finally(() => {
+                writing.delete(agent);
+                if (checkpointRequested.delete(agent))
+                    scheduleCheckpoint(agent, spine);
+            });
+        });
+        saving.set(agent, scheduled);
+    }
+    ctx.on("agent/created", async ({ agent }) => {
+        const spine = await attachAgent(agent);
+        scheduleCheckpoint(agent, spine);
+    });
+    ctx.on("agent/disposed", ({ agent }) => {
+        waitingParents.get(agent)?.abort();
+        const scheduled = saving.get(agent);
+        if (scheduled !== undefined)
+            clearImmediate(scheduled);
+        saving.delete(agent);
+        checkpointRequested.delete(agent);
+    });
     ctx.on("agent/status", ({ agent, status }) => {
         if (status !== "idle")
             return;
@@ -314,6 +355,7 @@ export function apply(ctx) {
         }
         own.settle(open, aborted || (claimed?.size ?? 0) > 0 || (stopClaims?.size ?? 0) > 0);
         world.idle.get(agent.id)?.settle(aborted);
+        scheduleCheckpoint(agent, spine);
     });
     ctx.on("agent/pre-step", async (payload, next) => {
         // Existing agents do not emit agent/created again after a plugin reload.
@@ -377,6 +419,10 @@ export function apply(ctx) {
     ctx.effect(() => () => {
         unloading = true;
         lifetime.abort(new SpineDshError("Spine is reloading; retry this turn once it is ready"));
+        for (const scheduled of saving.values())
+            clearImmediate(scheduled);
+        saving.clear();
+        checkpointRequested.clear();
         for (const wait of waitingParents.values())
             wait.abort();
         waitingParents.clear();

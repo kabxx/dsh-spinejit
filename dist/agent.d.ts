@@ -2,6 +2,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { type SessionEvent } from "@deepseek-ai/dsh-session";
 import type { FeatureFlag, SpineProjection } from "@spinejit/spine-sdk";
 import { type SpawnBirth, type SpineToolName } from "@spinejit/spine-sdk/host";
+import { LatestCheckpoint } from "./reopen-checkpoint.js";
 export declare const SPINE_FEATURES: FeatureFlag[];
 /**
  * Hands over the births a live commit made and where their sampling began in
@@ -34,7 +35,9 @@ export declare class SpineAgent {
     #private;
     readonly agent: Agent;
     private constructor();
-    static create(agent: Agent, configToml: string, born: BirthHandler, changed: ProjectionHandler): Promise<SpineAgent>;
+    static create(agent: Agent, configToml: string, born: BirthHandler, changed: ProjectionHandler, storage: ConstructorParameters<typeof LatestCheckpoint>[1], signal: AbortSignal): Promise<SpineAgent>;
+    /** Export a detached snapshot of a durable idle prefix without reserving the Agent. */
+    saveCheckpoint(configToml: string, pluginSignal: AbortSignal): Promise<void>;
     get projection(): SpineProjection | null;
     get fault(): unknown;
     /** Index one event of this agent's session; a new source waits for observation. */

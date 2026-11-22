@@ -1,8 +1,10 @@
+import { setImmediate as yieldToLoop } from "node:timers/promises";
 import { isAppendSurfaceEvent, pluginRecordOf } from "@deepseek-ai/dsh-session";
 import { createHostAdapter, isSpineToolName, operationFromSpineToolCall, spineToolRefusal, spineToolResult, unarrivedBirths, } from "@spinejit/spine-sdk/host";
-import { createNodeSpineRuntime } from "@spinejit/spine-sdk/node";
 import { anchorPrefix, firstText, hasRepairedInlineAnchor, logAnchors, USER_ANCHORS } from "./anchors.js";
 import { arrivalOf, beginsSampling, emptySlot, endsSampling, eventMessage, isUserSource, samplingSlot, sourceCharacter, SpineDshError, spineText, surfaceRole, } from "./events.js";
+import { checkpointBuild, createCheckpointNodeRuntime } from "./checkpoint-runtime.js";
+import { LatestCheckpoint } from "./reopen-checkpoint.js";
 import { applySurfaceEdits, planItems, surfaceEdits } from "./projection.js";
 import { dropReasoning, hasReasoning } from "./reasoning.js";
 import { sessionBirth } from "./spawn.js";
@@ -35,6 +37,9 @@ export class SpineAgent {
     #born;
     #changed;
     #adapter;
+    #runtime;
+    #checkpoint;
+    #checkpointLifetime = new AbortController();
     /** Every session event seen, by seq. */
     #events = new Map();
     /** Logged sources the core has not observed yet, in log order. */
@@ -50,6 +55,9 @@ export class SpineAgent {
     /** Births whose arrival is in the log, by producer. */
     #entered = new Set();
     #recovering = false;
+    // A preview at the end of recovery can expose pending input before its
+    // next recorded sampling. That preview is not a reusable replay boundary.
+    #recoveryPreview = false;
     #sampling = null;
     #turn = 0;
     #step = 0;
@@ -60,38 +68,157 @@ export class SpineAgent {
         this.#born = born;
         this.#changed = changed;
     }
-    static async create(agent, configToml, born, changed) {
+    static async create(agent, configToml, born, changed, storage, signal) {
+        signal.throwIfAborted();
         const events = agent.session.snapshotEvents();
         const { thread, continuations } = forkNamespaces(events, agent.id, agent.session.header.parentSession);
-        const runtime = createNodeSpineRuntime({ thread, features: SPINE_FEATURES, configToml });
-        const spine = new SpineAgent(agent, runtime.nodePrompt(), born, changed);
-        spine.#adapter = await createHostAdapter({
-            runtime: runtime.client,
-            host: {
-                // DSH has no ownership registry. Another writer that rewrites conversation
-                // context moves a plan source off the surface, and the projection faults.
-                claimOwnership: async () => { },
-                // Every fact a commit derives from is already in the session log.
-                persistArchive: async () => { },
-                context: {
-                    materialize: async (context) => planItems(context, (id) => spine.#seqOf(id)),
-                    publishAtomic: async (context) => {
-                        spine.#plan = [...context.messages];
-                        spine.#project(context.projection);
-                    },
-                },
-            },
-            dispose: () => runtime.dispose(),
-        });
-        // A resumed session brings its log as seed events, which are never published.
+        const checkpoint = new LatestCheckpoint(agent, storage, checkpointBuild(), configToml);
+        const cached = await checkpoint.read(events, signal);
+        signal.throwIfAborted();
+        if (cached !== undefined) {
+            const spine = await SpineAgent.#initialize(agent, agent.id, configToml, born, changed);
+            try {
+                signal.throwIfAborted();
+                await spine.#runtime.importCheckpoint(cached.sdk);
+                signal.throwIfAborted();
+                spine.#installCheckpoint(events.slice(0, cached.through + 1), cached.host);
+                await spine.#recover(events.slice(cached.through + 1), continuations, signal);
+                signal.throwIfAborted();
+                checkpoint.markRestored(cached.through);
+                spine.#checkpoint = checkpoint;
+                return spine;
+            }
+            catch {
+                spine.dispose();
+                signal.throwIfAborted();
+            }
+        }
+        signal.throwIfAborted();
+        const spine = await SpineAgent.#initialize(agent, thread, configToml, born, changed);
+        spine.#checkpoint = checkpoint;
         try {
-            await spine.#recover(events, continuations);
+            await spine.#recover(events, continuations, signal);
+            signal.throwIfAborted();
         }
         catch (error) {
             spine.dispose();
             throw error;
         }
         return spine;
+    }
+    static async #initialize(agent, thread, configToml, born, changed) {
+        const runtime = createCheckpointNodeRuntime({ thread, features: SPINE_FEATURES, configToml });
+        const spine = new SpineAgent(agent, runtime.nodePrompt(), born, changed);
+        spine.#runtime = runtime;
+        try {
+            spine.#adapter = await createHostAdapter({
+                runtime: runtime.client,
+                host: {
+                    // DSH has no ownership registry. Another writer that rewrites conversation
+                    // context moves a plan source off the surface, and the projection faults.
+                    claimOwnership: async () => { },
+                    // Every fact a commit derives from is already in the session log.
+                    persistArchive: async () => { },
+                    context: {
+                        materialize: async (context) => planItems(context, (id) => spine.#seqOf(id)),
+                        publishAtomic: async (context) => {
+                            spine.#plan = [...context.messages];
+                            spine.#project(context.projection);
+                        },
+                    },
+                },
+                dispose: () => runtime.dispose(),
+            });
+        }
+        catch (error) {
+            runtime.dispose();
+            throw error;
+        }
+        return spine;
+    }
+    #exportHostCheckpoint() {
+        return {
+            sourceSeqs: [...this.#sourceSeqs], userNumbers: [...this.#userNumbers],
+            anchored: [...this.#anchored], anchorInText: [...this.#anchorInText], entered: [...this.#entered],
+            plan: this.#plan, projection: this.#projection,
+        };
+    }
+    #installCheckpoint(events, host) {
+        for (const event of events)
+            this.#events.set(event.seq, event);
+        for (const [id, seq] of host.sourceSeqs) {
+            this.#event(seq);
+            this.#sourceSeqs.set(id, seq);
+        }
+        for (const [seq, number] of host.userNumbers) {
+            if (!isUserSource(this.#event(seq)) || number !== this.#userNumbers.size + 1) {
+                throw new SpineDshError("Checkpoint user numbers do not match the log.");
+            }
+            this.#userNumbers.set(seq, number);
+        }
+        for (const seq of host.anchored)
+            this.#anchored.add(seq);
+        for (const seq of host.anchorInText)
+            this.#anchorInText.add(seq);
+        for (const producer of host.entered)
+            this.#entered.add(producer);
+        for (const item of host.plan ?? [])
+            if (item.type === "source")
+                this.#event(item.seq);
+        this.#plan = host.plan;
+        this.#projection = host.projection;
+    }
+    /** Export a detached snapshot of a durable idle prefix without reserving the Agent. */
+    async saveCheckpoint(configToml, pluginSignal) {
+        const { agent } = this;
+        const owner = AbortSignal.any([this.#checkpointLifetime.signal, pluginSignal]);
+        if (owner.aborted || agent.status !== "idle" || this.fault !== null || this.#recovering
+            || this.#recoveryPreview || this.#plan === null)
+            return;
+        const events = agent.session.snapshotEvents();
+        const through = events.at(-1)?.seq;
+        if (through === undefined || !this.#checkpoint.needsUpdate(through))
+            return;
+        if ([...this.#userNumbers.keys()].some((seq) => !this.#anchored.has(seq)))
+            return;
+        const sampling = this.#sampling;
+        const host = this.#exportHostCheckpoint();
+        let payload;
+        if (sampling === null) {
+            if (this.#unobserved.length !== 0)
+                return;
+            payload = { host, sdk: await this.#runtime.exportCheckpoint() };
+        }
+        else {
+            // Capture the pre-sampling SDK state before yielding to another step.
+            // Settle the final sampling on a separate runtime with the frozen tail,
+            // no tool execution, message writes or tree publication.
+            const end = events.findIndex((event) => event.seq === sampling.from);
+            if (end < 0 || !beginsSampling(events[end]) || this.#unobserved.some((event) => event.seq < sampling.from))
+                return;
+            const tail = events.slice(end);
+            if (!tail.some((event) => event.type === "step/end") || tail.slice(1).some((event) => beginsSampling(event) || isUserSource(event) || arrivalOf(event) !== null
+                || pluginRecordOf(event)?.type === USER_ANCHORS
+                || (event.type === "session/end-seed" && event.data.inherited)))
+                return;
+            const state = await this.#runtime.exportPreSamplingCheckpoint();
+            const shadow = await SpineAgent.#initialize(agent, agent.id, configToml, async () => { }, () => { });
+            try {
+                await shadow.#runtime.importCheckpoint(state);
+                shadow.#installCheckpoint(events.slice(0, end), host);
+                await shadow.#recover(tail, new Map(), owner);
+                if (shadow.#recoveryPreview)
+                    return;
+                payload = { host: shadow.#exportHostCheckpoint(), sdk: await shadow.#runtime.exportCheckpoint() };
+            }
+            finally {
+                shadow.dispose();
+            }
+        }
+        owner.throwIfAborted();
+        if (await this.#checkpoint.flush() === false)
+            return;
+        await this.#checkpoint.write(events, payload, owner);
     }
     get projection() {
         return this.#projection;
@@ -189,6 +316,7 @@ export class SpineAgent {
             await this.#settle(this.#end(this.#sampling.from));
     }
     dispose() {
+        this.#checkpointLifetime.abort();
         this.#adapter.dispose();
     }
     /**
@@ -197,10 +325,16 @@ export class SpineAgent {
      * or at the end of the log. A forked session continues in its own
      * namespace where its inherited prefix ends.
      */
-    async #recover(events, continuations) {
+    async #recover(events, continuations, signal) {
+        signal.throwIfAborted();
         const possibleLegacyAnchors = [];
         this.#recovering = true;
-        for (const event of events) {
+        for (const [index, event] of events.entries()) {
+            // SDK calls can resolve without yielding to the host. Give a reload
+            // or shutdown a chance to cancel a long historical replay.
+            if (index > 0 && index % 128 === 0)
+                await yieldToLoop();
+            signal.throwIfAborted();
             const sampling = beginsSampling(event);
             if (sampling) {
                 // Older versions logged the anchor in the user text before sampling.
@@ -252,10 +386,14 @@ export class SpineAgent {
                 });
             }
         }
+        signal.throwIfAborted();
         await this.settle();
+        signal.throwIfAborted();
         // Observe the entire recovery tail, including pending user sources, repaired
         // inline anchors and DSH's synthetic Fork results, before applying the plan.
-        await this.#guard(() => this.#prepare());
+        this.#recoveryPreview = this.#unobserved.length > 0;
+        if (this.#recoveryPreview)
+            await this.#guard(() => this.#prepare());
         this.#recovering = false;
     }
     #project(projection) {
@@ -282,6 +420,7 @@ export class SpineAgent {
     async #begin(from) {
         await this.#adapter.beginSampling();
         this.#sampling = { from, called: null };
+        this.#recoveryPreview = false;
     }
     /** Where the stretch of the sampling that began at `from` ends, as logged so far. */
     #end(from) {
