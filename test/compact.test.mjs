@@ -9,7 +9,7 @@ import { mountDsh } from "./harness.mjs";
 
 const commandModule = new URL("../dist/compact.js", import.meta.url).href;
 
-async function mountCompact(replies, options, CommandRuntime) {
+async function mountCompact(replies, options, CommandRuntime, compactConfig) {
   const dsh = await mountDsh(replies, options);
   let command;
   if (CommandRuntime) await dsh.ctx.plugin(CommandRuntime).await();
@@ -22,7 +22,7 @@ async function mountCompact(replies, options, CommandRuntime) {
   });
   await dsh.ctx.loader.root.update([
     { id: "spinejit", name: new URL("../dist/index.js", import.meta.url).href },
-    { id: "spine-compact", name: commandModule },
+    { id: "spine-compact", name: commandModule, ...(compactConfig === undefined ? {} : { config: compactConfig }) },
   ]);
   await dsh.ctx.loader.await();
   if (!CommandRuntime) assert.equal(command?.name, "compact");
@@ -120,25 +120,40 @@ test("/compact applies a durable Spine checkpoint and can continue before or aft
   try {
     const agent = await dsh.run("remember this");
     const oldLog = agent.session.snapshotEvents();
+    const expectedShadowed = agent.session.surface.nodes.filter(
+      seq => agent.session.eventAt(seq)?.type !== "system/message",
+    );
     const result = await dsh.compact(agent);
     assert.equal(result.kind, "success", result.text);
     const [marker] = checkpoints(agent);
     assert.equal(result.sourceEventSeq, marker.seq);
-    assert.equal(result.text, `Compacted conversation (~1,500 tokens).\n\n${summary}`);
+    assert.equal(
+      result.text,
+      `Compacted conversation (~${marker.data.source.shadowedTokens.toLocaleString("en-US")} history tokens; summary used ~1,500 input tokens).\n\n${summary}`,
+    );
     assert.equal(text([marker.data]), `Conversation checkpoint from SpineJIT /compact:\n\n${summary}`);
-    // The sidebar's default Fork stops before appended user messages, but
-    // includes replacements after the last completed turn.
+    // Replaces the entire non-system surface span atomically so token pressure
+    // drops immediately and default Fork includes the replacement after the turn.
     const oldReply = oldLog.find(event => event.type === "assistant/message" &&
       event.data.message.content.some(block => block.type === "text" && block.text === "original-answer-only"));
     assert.ok(oldReply);
-    assert.deepEqual(marker.surfaceOp, { op: "replace", startSeq: oldReply.seq, endSeq: oldReply.seq });
-    assert.deepEqual(marker.sourceEventSeqs, [oldReply.seq]);
+    assert.deepEqual(marker.surfaceOp, {
+      op: "replace",
+      startSeq: expectedShadowed[0],
+      endSeq: expectedShadowed.at(-1),
+    });
+    assert.deepEqual(marker.sourceEventSeqs, expectedShadowed);
     const shadowPrice = agent.session.eventAt(marker.seq - 1);
     assert.equal(shadowPrice.type, "compaction/prune");
-    assert.deepEqual(shadowPrice.data.shadowedRange, { start: oldReply.seq, end: oldReply.seq });
+    assert.deepEqual(shadowPrice.data.shadowedRange, {
+      start: expectedShadowed[0],
+      end: expectedShadowed.at(-1),
+    });
+    assert.deepEqual(shadowPrice.data.shadowedSeqs, expectedShadowed);
     assert.ok(shadowPrice.data.shadowedTokenCount > 0);
     assert.match(text(agent.session.deriveMessages()), /checkpoint body/);
     assert.doesNotMatch(text(agent.session.deriveMessages()), /original-answer-only/);
+    assert.doesNotMatch(text(agent.session.deriveMessages()), /remember this/);
     const stats = statistics(marker, oldLog);
     assert.equal(stats.target, "stats");
     assert.equal(stats.data.kind, "compaction");
@@ -227,9 +242,14 @@ for (const cut of ["user message", "user anchor"]) {
       assert.ok(agent.session.surface.nodes.includes(pendingSeq));
       const result = await dsh.compact(agent);
       assert.equal(result.kind, "success", result.text);
-      assert.equal(result.text, "Compacted conversation.\n\ncheckpoint body");
       const [marker] = checkpoints(agent);
-      assert.deepEqual(marker.surfaceOp, { op: "replace", startSeq: pendingSeq, endSeq: pendingSeq });
+      assert.equal(
+        result.text,
+        `Compacted conversation (~${marker.data.source.shadowedTokens.toLocaleString("en-US")} history tokens).\n\ncheckpoint body`,
+      );
+      assert.equal(marker.surfaceOp.op, "replace");
+      assert.equal(marker.surfaceOp.endSeq, pendingSeq);
+      assert.ok(marker.sourceEventSeqs.includes(pendingSeq));
       const anchors = agent.session.snapshotEvents().filter(event => event.type === "plugin:spinejit/user-anchors" &&
         event.data.anchors.some(entry => entry.seq === pendingSeq));
       assert.equal(anchors.length, 1);
@@ -246,13 +266,62 @@ for (const cut of ["user message", "user anchor"]) {
   });
 }
 
-test("/compact preserves the call ID and failure status of each tool result", async () => {
+test("/compact preserves the call ID and failure status of each tool result in both warm and clean modes", async () => {
   const identicalContent = [{ type: "text", text: "Error: identical result" }];
-  const dsh = await mountCompact([
+  const probeTool = {
+    name: "probe",
+    description: "Return the same text for success and failure.",
+    parameters: { type: "object", properties: { fail: { type: "boolean" } }, required: ["fail"] },
+    output: { schema: { type: "object", properties: {} }, render: () => identicalContent },
+    execute: async ({ fail }) => {
+      if (fail) throw new Error("identical result");
+      return {};
+    },
+  };
+
+  // Part A: cache-warm mode preserves native tool-call IDs and tool-result isError flags.
+  const dshWarm = await mountCompact([
     [["probe", { fail: false }], ["probe", { fail: true }]],
     "both tools returned",
     request => {
       assert.equal(request.purpose, "compaction");
+      assert.equal(request.messages[0].role, "system");
+      assert.ok(Array.isArray(request.tools) && request.tools.length > 0);
+      const calls = request.messages.filter(message => message.role === "assistant")
+        .flatMap(message => message.content.filter(block => block.type === "tool-call"));
+      assert.equal(calls.length, 2);
+      assert.notEqual(calls[0].id, calls[1].id);
+      const results = request.messages.filter(message => message.role === "tool");
+      assert.equal(results.length, 2);
+      const okResult = results.find(result => result.toolCallId === calls[0].id);
+      const errResult = results.find(result => result.toolCallId === calls[1].id);
+      assert.deepEqual(okResult.content, identicalContent);
+      assert.equal(okResult.isError === true, false);
+      assert.deepEqual(errResult.content, identicalContent);
+      assert.equal(errResult.isError, true);
+      return "warm checkpoint body";
+    },
+  ]);
+  try {
+    dshWarm.ctx.tools.register(probeTool);
+    const agent = await dshWarm.run("try both tools warm");
+    const results = agent.session.deriveMessages().filter(message => message.role === "tool");
+    assert.equal(results.length, 2);
+    assert.ok(results.every(result => result.content[0]?.text === identicalContent[0].text));
+    assert.deepEqual(results.map(result => result.isError === true).sort(), [false, true]);
+    const result = await dshWarm.compact(agent);
+    assert.equal(result.kind, "success", result.text);
+  } finally {
+    await dshWarm.dispose();
+  }
+
+  // Part B: clean tool-free mode (e.g. dedicated summarization model) preserves toolCallId and isError in JSONL.
+  const dshClean = await mountCompact([
+    [["probe", { fail: false }], ["probe", { fail: true }]],
+    "both tools returned",
+    request => {
+      assert.equal(request.purpose, "compaction");
+      assert.equal(request.tools, undefined);
       const transcript = text(request.messages).split("\n").map(line => JSON.parse(line));
       const calls = transcript.filter(message => message.role === "assistant")
         .flatMap(message => message.content.filter(block => block.type === "tool-call"));
@@ -266,29 +335,20 @@ test("/compact preserves the call ID and failure status of each tool result", as
       assert.deepEqual(results.find(result => result.toolCallId === calls[1].id), {
         role: "tool", content: identicalContent, toolCallId: calls[1].id, isError: true,
       });
-      return "checkpoint body";
+      return "clean checkpoint body";
     },
-  ]);
+  ], {}, undefined, {
+    auto: false,
+    summarizationProvider: "scripted",
+    summarizationModel: "summarizer-dedicated",
+  });
   try {
-    dsh.ctx.tools.register({
-      name: "probe",
-      description: "Return the same text for success and failure.",
-      parameters: { type: "object", properties: { fail: { type: "boolean" } }, required: ["fail"] },
-      output: { schema: { type: "object", properties: {} }, render: () => identicalContent },
-      execute: async ({ fail }) => {
-        if (fail) throw new Error("identical result");
-        return {};
-      },
-    });
-    const agent = await dsh.run("try both tools");
-    const results = agent.session.deriveMessages().filter(message => message.role === "tool");
-    assert.equal(results.length, 2);
-    assert.ok(results.every(result => result.content[0]?.text === identicalContent[0].text));
-    assert.deepEqual(results.map(result => result.isError === true).sort(), [false, true]);
-    const result = await dsh.compact(agent);
+    dshClean.ctx.tools.register(probeTool);
+    const agent = await dshClean.run("try both tools clean");
+    const result = await dshClean.compact(agent);
     assert.equal(result.kind, "success", result.text);
   } finally {
-    await dsh.dispose();
+    await dshClean.dispose();
   }
 });
 
@@ -376,41 +436,50 @@ test("a cancelled or incomplete summary does not change the model context", asyn
   }
 });
 
-test("/compact recovers an unanswered turn while respecting the model cap and recording summary usage", async () => {
+test("/compact recovers an unanswered turn after warm overflow by pruning oversized tool results in memory", async () => {
   const overflow = () => { throw new LlmError("Context window exceeded", "CONTEXT_WINDOW_EXCEEDED"); };
-  const olderUsage = { inputTokens: 110, cacheReadTokens: 10, outputTokens: 11 };
-  const newerUsage = { inputTokens: 90, cacheWriteTokens: 5, outputTokens: 9 };
-  const mergerUsage = { inputTokens: 65, outputTokens: 8 };
-  const excerpts = [];
+  const hugeToolText = `TOOL_HEAD_MARKER ${"middle-log-padding ".repeat(600)} TOOL_TAIL_MARKER`;
+  assert.ok(hugeToolText.length > 8_192);
+  const prunedUsage = { inputTokens: 250, cacheReadTokens: 20, cacheWriteTokens: 10, outputTokens: 28 };
   const dsh = await mountCompact([
     "original-answer-only",
     "first checkpoint",
+    [["big_log", {}]],
+    // Model request after big_log returns CONTEXT_WINDOW_EXCEEDED (turn left unanswered).
     overflow,
+    // Manual /compact warm attempt hits CONTEXT_WINDOW_EXCEEDED.
     request => {
       assert.equal(request.purpose, "compaction");
       assert.equal(request.maxTokens, 2048);
+      assert.ok(Array.isArray(request.tools) && request.tools.length > 0);
       assert.match(text(request.messages), /unanswered-start/);
-      assert.match(text(request.messages), /unanswered-end/);
+      assert.match(text(request.messages), /TOOL_HEAD_MARKER/);
       return overflow();
     },
+    // Stage 2: single clean summary with >8,192-char tool result pruned in memory (head + marker + tail).
     request => {
+      assert.equal(request.purpose, "compaction");
       assert.equal(request.maxTokens, 2048);
-      excerpts.push(text(request.messages));
-      return { text: "older excerpt summary", usage: olderUsage };
-    },
-    request => {
-      assert.equal(request.maxTokens, 2048);
-      excerpts.push(text(request.messages));
-      assert.match(excerpts.join(""), /unanswered-start.*unanswered-end/s);
-      return { text: "newer excerpt summary", usage: newerUsage };
-    },
-    request => {
-      assert.equal(request.maxTokens, 2048);
-      assert.match(text(request.messages), /older excerpt summary.*newer excerpt summary/s);
-      return { text: "checkpoint body", usage: mergerUsage };
+      assert.equal(request.tools, undefined);
+      const body = text(request.messages);
+      assert.match(body, /unanswered-start/);
+      assert.match(body, /TOOL_HEAD_MARKER/);
+      assert.match(body, /TOOL_TAIL_MARKER/);
+      assert.match(body, /\[\.\.\. tool result middle pruned \.\.\.\]/);
+      return { text: "checkpoint body", usage: prunedUsage };
     },
     "continued",
-  ]);
+  ], {}, undefined, { auto: false });
+  dsh.ctx.tools.register({
+    name: "big_log",
+    description: "Return an oversized tool log.",
+    parameters: { type: "object", properties: {} },
+    output: {
+      schema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
+      render: (_args, value) => [{ type: "text", text: value.text }],
+    },
+    execute: async () => ({ text: hugeToolText }),
+  });
   const resolveModel = dsh.adapter.resolveModel.bind(dsh.adapter);
   dsh.adapter.resolveModel = async (...args) => ({
     ...await resolveModel(...args),
@@ -420,17 +489,14 @@ test("/compact recovers an unanswered turn while respecting the model cap and re
   const route = { provider: "scripted", model: "scripted" };
   const expectedCalls = [
     route,
-    { ...route, usage: olderUsage },
-    { ...route, usage: newerUsage },
-    { ...route, usage: mergerUsage },
+    { ...route, usage: prunedUsage },
   ];
   let root;
   try {
     const agent = await dsh.run("task");
     assert.equal((await dsh.compact(agent)).kind, "success");
-    await dsh.send(agent, `unanswered-start ${"large ".repeat(100)} unanswered-end`);
+    await dsh.send(agent, "unanswered-start inspect big log");
     const oldLog = agent.session.snapshotEvents();
-    assert.equal(oldLog.filter(event => event.type === "assistant/message").length, 1);
     const result = await dsh.compact(agent);
     assert.equal(result.kind, "success", result.text);
     assert.ok(result.sourceEventSeq);
@@ -439,12 +505,15 @@ test("/compact recovers an unanswered turn while respecting the model cap and re
     const stats = statistics(checkpoints(agent)[1], oldLog);
     assert.equal(stats.data.metrics.context, 280);
     assert.equal(stats.data.metrics.output, 28);
-    assert.equal(stats.data.metrics.cacheRead, 10);
-    assert.equal(stats.data.metrics.cacheWrite, 5);
+    assert.equal(stats.data.metrics.cacheRead, 20);
+    assert.equal(stats.data.metrics.cacheWrite, 10);
     assert.equal(stats.data.metrics.cacheHit, null);
     assert.equal(stats.data.metrics.provider, route.provider);
     assert.equal(stats.data.metrics.model, route.model);
-    assert.equal(result.text, "Compacted conversation (~280 tokens).\n\ncheckpoint body");
+    assert.equal(
+      result.text,
+      `Compacted conversation (~${checkpoints(agent)[1].data.source.shadowedTokens.toLocaleString("en-US")} history tokens; summary used ~280 input tokens).\n\ncheckpoint body`,
+    );
     assert.deepEqual(agent.session.snapshotEvents().slice(0, oldLog.length), oldLog);
     root = await dsh.crashed();
     await dsh.send(agent, "try again");

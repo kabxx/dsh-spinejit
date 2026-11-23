@@ -5,6 +5,8 @@ declare module "@deepseek-ai/dsh-llm/types" {
 }
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
+import { type SpineCompactConfig } from "./compact-summarizer.js";
+export type { SpineCompactConfig } from "./compact-summarizer.js";
 export declare const name = "spinejit-compact";
 export declare const inject: string[];
 interface Invocation {
@@ -30,6 +32,5 @@ type CompactContext = Context & {
         }): () => void;
     };
 };
-export declare function apply(ctx: CompactContext): void;
-export {};
+export declare function apply(ctx: CompactContext, rawConfig?: SpineCompactConfig): void;
 //# sourceMappingURL=compact.d.ts.map

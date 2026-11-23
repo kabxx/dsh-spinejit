@@ -36,6 +36,12 @@ export function withoutReasoning(message: Message): Message {
   return freezeMessage({ ...message, content, source } as unknown as Message);
 }
 
+/** Whether the message carries pi-ai replay metadata from the Anthropic Messages API. */
+export function isAnthropicMessagesReplay(message: Message): boolean {
+  const replayState = (message.source as { replayState?: { response?: { kind?: unknown; api?: unknown } } }).replayState;
+  return replayState?.response?.kind === "pi-ai" && replayState.response.api === "anthropic-messages";
+}
+
 /**
  * Whether the message still carries reasoning the label asks to drop.
  *

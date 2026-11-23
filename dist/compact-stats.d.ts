@@ -8,6 +8,7 @@ interface CheckpointStats {
     readonly turn: number;
     readonly calls: readonly CompactCall[];
     readonly summaryChars: number;
+    readonly shadowedTokens: number | null;
 }
 interface StatsContext {
     readonly key: string;
@@ -53,7 +54,7 @@ export declare const compactStatsDefinition: {
                 cacheWrite: number | null;
                 provider: string;
                 model: string;
-                shadowedTokens: null;
+                shadowedTokens: number | null;
                 summaryChars: number;
                 error: null;
             };

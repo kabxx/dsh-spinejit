@@ -294,13 +294,19 @@ var compactStatsDefinition = {
   },
   start(_context, { event }, reader) {
     const message = checkpoint(event);
-    const end = reader.previous("stats-turn-end")?.matches[0]?.event;
-    if (message === null || end?.type !== "turn/end") return null;
+    if (message === null) return null;
+    let turn = message.source.turn;
+    if (turn === void 0) {
+      const end = reader.previous("stats-turn-end")?.matches[0]?.event;
+      if (end?.type !== "turn/end") return null;
+      turn = end.data.turn;
+    }
     const text = message.content.reduce((text2, block) => block.type === "text" ? text2 + block.text : text2, "");
     return {
-      turn: end.data.turn,
+      turn,
       calls: message.source.calls ?? [],
-      summaryChars: text.startsWith(COMPACT_CHECKPOINT_PREFIX) ? text.length - COMPACT_CHECKPOINT_PREFIX.length : text.length
+      summaryChars: text.startsWith(COMPACT_CHECKPOINT_PREFIX) ? text.length - COMPACT_CHECKPOINT_PREFIX.length : text.length,
+      shadowedTokens: typeof message.source.shadowedTokens === "number" ? message.source.shadowedTokens : null
     };
   },
   update(context) {
@@ -351,7 +357,7 @@ var compactStatsDefinition = {
         cacheWrite: reportedWrite ? cacheWrite : null,
         provider: route.provider,
         model: route.model,
-        shadowedTokens: null,
+        shadowedTokens: state.shadowedTokens,
         summaryChars: state.summaryChars,
         error: null
       } }

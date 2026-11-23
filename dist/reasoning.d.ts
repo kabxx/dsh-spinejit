@@ -16,6 +16,8 @@ declare module "@deepseek-ai/dsh-session/types" {
 }
 /** The message without its reasoning blocks and provider replay state. */
 export declare function withoutReasoning(message: Message): Message;
+/** Whether the message carries pi-ai replay metadata from the Anthropic Messages API. */
+export declare function isAnthropicMessagesReplay(message: Message): boolean;
 /**
  * Whether the message still carries reasoning the label asks to drop.
  *

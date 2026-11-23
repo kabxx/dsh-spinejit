@@ -14,18 +14,25 @@ export const compactStatsDefinition = {
     },
     start(_context, { event }, reader) {
         const message = checkpoint(event);
-        // The checkpoint is saved outside a turn. Place it after the last real
-        // turn that preceded it, using the native Stats turn-end context.
-        const end = reader.previous("stats-turn-end")?.matches[0]?.event;
-        if (message === null || end?.type !== "turn/end")
+        if (message === null)
             return null;
+        // Automatic compactions record their enclosing open turn directly; idle
+        // manual checkpoints sit outside a turn and attach after the last turn end.
+        let turn = message.source.turn;
+        if (turn === undefined) {
+            const end = reader.previous("stats-turn-end")?.matches[0]?.event;
+            if (end?.type !== "turn/end")
+                return null;
+            turn = end.data.turn;
+        }
         const text = message.content.reduce((text, block) => block.type === "text" ? text + block.text : text, "");
         return {
-            turn: end.data.turn,
+            turn,
             calls: message.source.calls ?? [],
             summaryChars: text.startsWith(COMPACT_CHECKPOINT_PREFIX)
                 ? text.length - COMPACT_CHECKPOINT_PREFIX.length
                 : text.length,
+            shadowedTokens: typeof message.source.shadowedTokens === "number" ? message.source.shadowedTokens : null,
         };
     },
     update(context) { return context.state ?? null; },
@@ -72,7 +79,7 @@ export const compactStatsDefinition = {
                     cacheWrite: reportedWrite ? cacheWrite : null,
                     provider: route.provider,
                     model: route.model,
-                    shadowedTokens: null,
+                    shadowedTokens: state.shadowedTokens,
                     summaryChars: state.summaryChars,
                     error: null,
                 } },

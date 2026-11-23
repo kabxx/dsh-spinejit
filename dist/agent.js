@@ -1,11 +1,11 @@
-import { deriveEventMessage, isAppendSurfaceEvent, pluginRecordOf, SessionSeq } from "@deepseek-ai/dsh-session";
-import { estimateMessage } from "@deepseek-ai/dsh-token-meter/estimate";
+import { isAppendSurfaceEvent, pluginRecordOf, SessionSeq } from "@deepseek-ai/dsh-session";
 import { createHostAdapter, isSpineToolName, operationFromSpineToolCall, spineToolRefusal, spineToolResult, unarrivedBirths, } from "@spinejit/spine-sdk/host";
 import { createNodeSpineRuntime } from "@spinejit/spine-sdk/node";
 import { anchorPrefix, firstText, hasRepairedInlineAnchor, logAnchors, USER_ANCHORS } from "./anchors.js";
-import { arrivalOf, beginsSampling, compactBarrierOf, compactMessage, emptySlot, endsSampling, eventMessage, isUserSource, samplingSlot, sourceCharacter, SpineDshError, spineText, surfaceRole, } from "./events.js";
+import { estimateEffectiveTokens, hasNewConversation, selectCompactPlan, } from "./compact-range.js";
+import { arrivalOf, beginsSampling, compactBarrierOf, compactDroppedReasoningSeqsOf, compactMessage, compactRetainedSeqsOf, emptySlot, endsSampling, eventMessage, isUserSource, samplingSlot, sourceCharacter, SpineDshError, spineText, surfaceRole, } from "./events.js";
 import { applySurfaceEdits, planItems, surfaceEdits } from "./projection.js";
-import { dropReasoning, hasReasoning } from "./reasoning.js";
+import { dropReasoning, hasReasoning, isAnthropicMessagesReplay } from "./reasoning.js";
 import { sessionBirth } from "./spawn.js";
 export const SPINE_FEATURES = ["jit", "spawn"];
 /**
@@ -44,6 +44,10 @@ export class SpineAgent {
     /** Logged sources the core has not observed yet, in log order. */
     #unobserved = [];
     #sourceSeqs = new Map();
+    /** Maps every Spine logical boundary to its underlying DSH session seq. */
+    #boundarySeqs = new Map();
+    /** Cumulative logical-boundary shift caused by retained trailing sources across compactions. */
+    #boundaryOffset = 0;
     /** Each user message's number, by seq: the n-th the user wrote in the log. */
     #userNumbers = new Map();
     /** User messages numbered for the model: in a user-anchors record, or (0.1.1 and earlier) in their text. */
@@ -53,7 +57,10 @@ export class SpineAgent {
     #projection = null;
     /** Births whose arrival is in the log, by producer. */
     #entered = new Set();
+    /** Retained assistant seqs whose reasoning must be stripped before any subsequent request. */
+    #compactDroppedReasoning = new Set();
     #recovering = false;
+    #compacting = false;
     #compactCheckpoint = null;
     #sampling = null;
     #turn = 0;
@@ -91,7 +98,7 @@ export class SpineAgent {
         });
         // A resumed session brings its log as seed events, which are never published.
         try {
-            await spine.#recover(events, continuations);
+            await spine.#recover(events, thread, continuations);
         }
         catch (error) {
             spine.dispose();
@@ -130,16 +137,79 @@ export class SpineAgent {
             return [];
         return unarrivedBirths(this.#projection).filter((birth) => !this.#entered.has(birth.producer.join(".")));
     }
+    /** Whether any Spawn child branch has not yet arrived back into this session. */
+    hasUnarrivedBirths() {
+        return this.openBirths().length > 0;
+    }
+    /**
+     * Admit claimed messages up through the final `spine-arrival` when the batch
+     * satisfies every remaining open Spawn birth, preserving the batch's exact
+     * chronological order so preceding user messages are never reordered behind
+     * an arrival while still satisfying Spine's arrival-before-compact invariant.
+     */
+    async admitPendingArrivals(messages) {
+        const admitted = new Set();
+        const open = this.openBirths();
+        if (open.length === 0 || messages.length === 0)
+            return admitted;
+        const openProducers = new Set(open.map((birth) => birth.producer.join(".")));
+        let lastArrivalIdx = -1;
+        for (let index = 0; index < messages.length; index += 1) {
+            const message = messages[index];
+            if (message.source.kind !== "spine-arrival")
+                continue;
+            const producer = message.source.arrival.producer.join(".");
+            if (!openProducers.has(producer))
+                continue;
+            openProducers.delete(producer);
+            lastArrivalIdx = index;
+        }
+        if (lastArrivalIdx < 0 || openProducers.size > 0)
+            return admitted;
+        const toAppend = messages.slice(0, lastArrivalIdx + 1);
+        await this.#guard(async () => {
+            for (const message of toAppend) {
+                const event = this.agent.session.append("user/message", message, { surfaceOp: "append" });
+                this.accept(event);
+                admitted.add(message.id);
+            }
+            await this.#prepare();
+        });
+        return admitted;
+    }
+    /**
+     * Estimate current effective model-context tokens, taking any pending Spine
+     * fold in `#plan` into account so automatic pressure checks do not misfire
+     * right after `spine_close` or `spine_next`.
+     */
+    effectiveTokenCount(tokenMeter, header, extraMessages, pricing, targetSystemTokens, clearLaterSystemMessages = false) {
+        return estimateEffectiveTokens(this.agent.session, this.#surface(), this.#plan, tokenMeter, header, extraMessages, pricing, targetSystemTokens, clearLaterSystemMessages);
+    }
     /** A step opened: bring the surface to the published plan. */
     async enterStep(turn, step) {
         this.#turn = turn;
         this.#step = step;
         await this.#guard(async () => {
-            if (this.#plan === null)
-                return;
-            applySurfaceEdits(this.agent.session, surfaceEdits(this.#surface(), this.#plan), turn, step);
-            dropReasoning(this.agent.session, this.#plan.flatMap((item) => item.type === "source" && item.withoutReasoning ? [item.seq] : []));
+            if (this.#plan !== null) {
+                applySurfaceEdits(this.agent.session, surfaceEdits(this.#surface(), this.#plan), turn, step);
+                dropReasoning(this.agent.session, this.#plan.flatMap((item) => item.type === "source" && item.withoutReasoning ? [item.seq] : []));
+            }
+            this.#dropPendingCompactReasoning();
         });
+    }
+    #dropPendingCompactReasoning() {
+        if (this.#compactDroppedReasoning.size === 0)
+            return;
+        const live = new Set(this.agent.session.surface.nodes);
+        const pending = [];
+        for (const seq of this.#compactDroppedReasoning) {
+            if (live.has(seq))
+                pending.push(seq);
+            else
+                this.#compactDroppedReasoning.delete(seq);
+        }
+        if (pending.length > 0)
+            dropReasoning(this.agent.session, pending);
     }
     /** A main-loop request is about to stream. Its messages must be the plan; it begins a sampling. */
     async beginSampling() {
@@ -198,95 +268,182 @@ export class SpineAgent {
         if (this.#sampling !== null)
             await this.#settle(this.#end(this.#sampling.from));
     }
-    /** Run under DSH's idle maintenance lock so input cannot start a turn mid-checkpoint. */
-    async compact(summarize, flush, signal) {
+    /**
+     * Compact the live Spine context into a durable checkpoint and advance the
+     * Spine epoch. Manual compaction runs under DSH's idle maintenance lock;
+     * automatic compaction runs at step boundaries, model switches, or overflow
+     * retries and safely skips whenever parallel Spawn children are still open.
+     */
+    async compact(options) {
+        const { mode, trigger, retainTokens = 0, tokenMeter, header, summarize, flush, signal } = options;
         signal.throwIfAborted();
-        await this.settle();
-        if (this.fault !== null)
-            throw new SpineDshError("Spine context is faulted", { cause: this.fault });
-        if (this.#projection !== null && unarrivedBirths(this.#projection).length > 0) {
-            throw new SpineDshError("Wait for the parallel branches to return before using /compact.");
-        }
-        const session = this.agent.session;
-        if (!hasNewConversation(session))
+        if (this.#compacting) {
+            if (mode === "manual")
+                throw new SpineDshError("A Spine compaction is already in progress.");
             return null;
-        const summary = await summarize(session.deriveMessages());
-        signal.throwIfAborted();
-        // Check that a durable writer is available before appending the checkpoint.
-        await flush();
-        signal.throwIfAborted();
-        const source = await this.#guard(async () => {
-            await this.#observe(Infinity);
-            return this.#adapter.sourceSnapshot();
-        });
-        signal.throwIfAborted();
-        return this.#guard(async () => {
-            // DSH's default Fork includes replacements after a completed turn, but
-            // stops before an appended user message. Keep the checkpoint at the tail
-            // of Spine's own surface without replacing any host-owned nodes.
-            const nodes = session.surface.nodes;
-            let replaced;
-            for (let index = nodes.length - 1; index >= 0; index--) {
-                const candidate = nodes[index];
-                if (surfaceRole(this.#event(candidate)) === "host")
-                    continue;
-                replaced = candidate;
-                break;
+        }
+        this.#compacting = true;
+        try {
+            await this.settle();
+            if (this.fault !== null)
+                throw new SpineDshError("Spine context is faulted", { cause: this.fault });
+            if (this.hasUnarrivedBirths()) {
+                if (mode === "manual") {
+                    throw new SpineDshError("Wait for the parallel branches to return before using /compact.");
+                }
+                return null;
             }
-            if (replaced === undefined)
-                throw new SpineDshError("No conversation position for the Spine checkpoint.");
-            // A resumed message can still need its number when compact replaces it.
-            this.#logPendingAnchors();
-            const shadowed = deriveEventMessage(this.#event(replaced));
-            const shadowedRange = { start: replaced, end: replaced };
-            session.append("compaction/prune", {
-                shadowedRange,
-                shadowedSeqs: [replaced],
-                shadowedTokenCount: shadowed === null ? 0 : estimateMessage(shadowed),
+            const session = this.agent.session;
+            if (mode === "manual" && !hasNewConversation(session))
+                return null;
+            // Ensure every logged source has been observed and the latest folded plan
+            // is published before selecting the live context to summarize.
+            await this.#guard(async () => {
+                await this.#prepare();
+                this.#dropPendingCompactReasoning();
             });
-            const seq = SessionSeq(session.seq);
-            const barrier = {
-                schema: "spine.compact.barrier.v1",
-                thread: source.thread,
-                previous_epoch: source.epoch,
-                next_epoch: source.epoch + 1,
-                boundary: seq - 1,
-                replacement_boundaries: [seq],
-            };
-            session.append("user/message", compactMessage(barrier, summary), {
-                surfaceOp: { op: "replace", startSeq: replaced, endSeq: replaced },
-                sourceEventSeqs: [replaced],
+            signal.throwIfAborted();
+            const selection = selectCompactPlan(session, {
+                mode,
+                retainTokens,
+                plan: this.#plan,
+                surface: this.#surface(),
+                tokenMeter,
+                header,
+                anchoredSeqs: this.#anchored,
             });
-            this.#compactCheckpoint = { seq, flush };
-            try {
-                await this.#applyCompact(barrier);
-                // DSH only permits developer/message replacements during a running step.
-                // enterStep will materialize the checkpoint before the next model request.
+            if (selection === null)
+                return null;
+            const beforeReplaceGen = session.surface.replaceGeneration;
+            const beforeSurfaceNodes = [...session.surface.nodes];
+            const summary = await summarize(selection);
+            signal.throwIfAborted();
+            // Verify the selected span stayed stable while summarization ran asynchronously.
+            if (session.surface.replaceGeneration !== beforeReplaceGen
+                || session.surface.nodes.length < selection.shadowedSeqs.length
+                || selection.shadowedSeqs.some((seq, index) => {
+                    const baseIdx = beforeSurfaceNodes.indexOf(selection.startSeq);
+                    return session.surface.nodes[baseIdx + index] !== seq;
+                })) {
+                throw new SpineDshError("Conversation surface changed during compaction.");
             }
-            catch (cause) {
-                throw new SpineCompactCommitError("The checkpoint was appended, but compaction could not finish. Check the session after reopening it before retrying.", { cause });
-            }
-            finally {
-                this.#compactCheckpoint = null;
-            }
-            return { seq, summary: summary.text };
-        });
+            // Check that a durable writer is available before appending the checkpoint.
+            await flush();
+            signal.throwIfAborted();
+            const source = await this.#guard(async () => {
+                await this.#observe(Infinity);
+                return this.#adapter.sourceSnapshot();
+            });
+            signal.throwIfAborted();
+            return await this.#guard(async () => {
+                // Record any pending [U#] anchors before replacing user messages.
+                this.#logPendingAnchors();
+                // Strip reasoning from retained assistant outputs BEFORE appending the
+                // checkpoint so both records share the same durability flush and no
+                // crash can leave a persisted checkpoint whose retained tail still
+                // exposes stale reasoning/replayState. Also record the seqs on the
+                // checkpoint so recovery can enforce the strip even on truncated logs.
+                //
+                // Exception: for Anthropic Messages (`anthropic-messages`), manual
+                // (budget-based) thinking requires the final assistant turn of an open
+                // tool round to retain its thinking block and signature. Leave that
+                // single message intact so `dsh-llm-pi-ai`'s `bindThinkingToPrefix`
+                // keeps it for manual thinking and strips it for adaptive thinking.
+                const openToolAssistant = openToolRoundAssistantSeq(session, selection.retainedSeqs);
+                const droppedReasoningSeqs = selection.retainedAssistantSeqs.filter((assistantSeq) => {
+                    const event = session.eventAt(assistantSeq);
+                    const message = event === undefined ? null : session.deriveEventMessage(event);
+                    if (message === null || !hasReasoning(message))
+                        return false;
+                    if (assistantSeq === openToolAssistant && isAnthropicMessagesReplay(message))
+                        return false;
+                    return true;
+                });
+                if (droppedReasoningSeqs.length > 0) {
+                    dropReasoning(session, droppedReasoningSeqs);
+                    for (const assistantSeq of droppedReasoningSeqs) {
+                        this.#compactDroppedReasoning.add(assistantSeq);
+                    }
+                }
+                const shadowedRange = { start: selection.startSeq, end: selection.endSeq };
+                session.append("compaction/prune", {
+                    shadowedRange,
+                    shadowedSeqs: [...selection.shadowedSeqs],
+                    shadowedTokenCount: selection.shadowedTokenCount,
+                });
+                const seq = SessionSeq(session.seq);
+                const offset = this.#boundaryOffset;
+                const checkpointBoundary = seq + offset;
+                const replacementBoundaries = [
+                    checkpointBoundary,
+                    ...selection.retainedSeqs.map((_, index) => checkpointBoundary + index + 1),
+                ];
+                const barrier = {
+                    schema: "spine.compact.barrier.v1",
+                    thread: source.thread,
+                    previous_epoch: source.epoch,
+                    next_epoch: source.epoch + 1,
+                    boundary: checkpointBoundary - 1,
+                    replacement_boundaries: replacementBoundaries,
+                };
+                session.append("user/message", compactMessage(barrier, summary, {
+                    retainedSeqs: selection.retainedSeqs,
+                    droppedReasoningSeqs,
+                    trigger,
+                    ...(selection.openTurn === null ? {} : { turn: selection.openTurn.turn }),
+                    shadowedTokens: selection.shadowedTokenCount,
+                }), {
+                    surfaceOp: { op: "replace", startSeq: selection.startSeq, endSeq: selection.endSeq },
+                    sourceEventSeqs: [...selection.shadowedSeqs],
+                });
+                this.#compactCheckpoint = { boundary: checkpointBoundary, flush };
+                try {
+                    await this.#applyCompact(barrier, seq, selection.retainedSeqs);
+                }
+                catch (cause) {
+                    throw new SpineCompactCommitError("The checkpoint was appended, but compaction could not finish. Check the session after reopening it before retrying.", { cause });
+                }
+                finally {
+                    this.#compactCheckpoint = null;
+                }
+                return {
+                    seq,
+                    summary: summary.text,
+                    shadowedSeqs: selection.shadowedSeqs,
+                    shadowedRange,
+                    shadowedTokenCount: selection.shadowedTokenCount,
+                    retainedSeqs: selection.retainedSeqs,
+                };
+            });
+        }
+        finally {
+            this.#compacting = false;
+        }
     }
     async #persistCompact(barrier) {
         if (this.#recovering)
             return;
         const checkpoint = this.#compactCheckpoint;
-        if (checkpoint === null || barrier.replacement_boundaries[0] !== checkpoint.seq) {
+        if (checkpoint === null || barrier.replacement_boundaries[0] !== checkpoint.boundary) {
             throw new SpineDshError("Spine checkpoint does not match the persisted replacement.");
         }
         // The SDK waits for durability before it changes epochs.
         await checkpoint.flush();
     }
-    async #applyCompact(barrier) {
+    async #applyCompact(barrier, checkpointSeq, retainedSeqs) {
         await this.#adapter.compact(barrier, { publish: false });
         const source = await this.#adapter.sourceSnapshot();
-        for (const cell of source.cells)
-            this.#sourceSeqs.set(sourceKey(cell.source_id), SessionSeq(cell.boundary));
+        const replacementSeqs = [checkpointSeq, ...retainedSeqs];
+        if (source.cells.length !== replacementSeqs.length) {
+            throw new SpineDshError(`Spine compact produced ${source.cells.length} cells for ${replacementSeqs.length} replacements`);
+        }
+        for (let index = 0; index < source.cells.length; index += 1) {
+            const cell = source.cells[index];
+            const seq = replacementSeqs[index];
+            this.#sourceSeqs.set(sourceKey(cell.source_id), seq);
+            this.#boundarySeqs.set(cell.boundary, seq);
+        }
+        this.#boundaryOffset += retainedSeqs.length;
         await this.#adapter.previewAndPublish();
     }
     dispose() {
@@ -298,8 +455,9 @@ export class SpineAgent {
      * or at the end of the log. A forked session continues in its own
      * namespace where its inherited prefix ends.
      */
-    async #recover(events, continuations) {
+    async #recover(events, initialThread, continuations) {
         const possibleLegacyAnchors = [];
+        let currentThread = initialThread;
         this.#recovering = true;
         for (const event of events) {
             const sampling = beginsSampling(event);
@@ -322,12 +480,29 @@ export class SpineAgent {
             if (nextThread !== undefined) {
                 possibleLegacyAnchors.length = 0;
                 await this.#guard(() => this.#continueNamespace(event.seq, nextThread));
+                currentThread = nextThread;
             }
             this.accept(event);
             if (barrier !== undefined) {
+                const recordedDrops = compactDroppedReasoningSeqsOf(event);
+                if (recordedDrops !== undefined) {
+                    for (const droppedSeq of recordedDrops)
+                        this.#compactDroppedReasoning.add(droppedSeq);
+                }
+                else {
+                    for (const retainedSeq of compactRetainedSeqsOf(event)) {
+                        if (this.#events.get(retainedSeq)?.type === "assistant/message") {
+                            this.#compactDroppedReasoning.add(retainedSeq);
+                        }
+                    }
+                }
+                // Copied compact barriers inside a forked session's inherited prefix
+                // carry the ancestor session's thread name, while replay uses the
+                // synthetic segment namespace assigned by forkNamespaces().
+                const replayBarrier = currentThread === this.agent.id ? barrier : { ...barrier, thread: currentThread };
                 await this.#guard(async () => {
                     await this.#observe(event.seq);
-                    await this.#applyCompact(barrier);
+                    await this.#applyCompact(replayBarrier, event.seq, compactRetainedSeqsOf(event));
                 });
             }
             if (isUserSource(event)) {
@@ -378,8 +553,11 @@ export class SpineAgent {
     async #continueNamespace(cut, thread) {
         await this.#observe(cut);
         const source = await this.#adapter.continueNamespace(thread);
-        for (const cell of source.cells)
-            this.#sourceSeqs.set(sourceKey(cell.source_id), cell.boundary);
+        for (const cell of source.cells) {
+            const seq = this.#boundarySeqs.get(cell.boundary) ?? SessionSeq(cell.boundary);
+            this.#sourceSeqs.set(sourceKey(cell.source_id), seq);
+            this.#boundarySeqs.set(cell.boundary, seq);
+        }
         await this.#adapter.previewAndPublish();
     }
     /** Observe every logged source and make sure a plan is published for it. */
@@ -450,11 +628,16 @@ export class SpineAgent {
         const events = this.#unobserved.splice(0, count < 0 ? this.#unobserved.length : count);
         if (events.length === 0)
             return 0;
-        const ids = await this.#adapter.observeSources(events.map((event) => sourceCharacter(event, this.#anchorInText.has(event.seq))));
+        const boundaries = events.map((event) => event.seq + this.#boundaryOffset);
+        const ids = await this.#adapter.observeSources(events.map((event, index) => sourceCharacter(event, this.#anchorInText.has(event.seq), boundaries[index])));
         if (ids.length !== events.length) {
             throw new SpineDshError(`Spine admitted ${ids.length} sources for ${events.length} events`);
         }
-        ids.forEach((id, index) => this.#sourceSeqs.set(sourceKey(id), events[index].seq));
+        ids.forEach((id, index) => {
+            const seq = events[index].seq;
+            this.#sourceSeqs.set(sourceKey(id), seq);
+            this.#boundarySeqs.set(boundaries[index], seq);
+        });
         return events.length;
     }
     /** Tool calls in the model response logged since `from`, the sampling's start. */
@@ -566,26 +749,6 @@ export class SpineAgent {
         }
     }
 }
-function hasNewConversation(session) {
-    const events = session.snapshotEvents();
-    let checkpoint = -1;
-    for (let index = events.length - 1; index >= 0; index--) {
-        if (compactBarrierOf(events[index]) === undefined)
-            continue;
-        checkpoint = events[index].seq;
-        break;
-    }
-    return session.surface.nodes.some((seq) => {
-        if (seq <= checkpoint)
-            return false;
-        const event = events[seq];
-        if (!isAppendSurfaceEvent(event) || surfaceRole(event) !== "source")
-            return false;
-        const message = session.deriveEventMessage(event);
-        return message?.content.some((block) => block.type !== "reasoning" &&
-            (block.type !== "text" || block.text.trim().length > 0)) ?? false;
-    });
-}
 /** Replay each inherited prefix before continuing in the namespace after its cut. */
 function forkNamespaces(events, sessionId, parentSession) {
     const continuations = new Map();
@@ -604,5 +767,24 @@ function forkNamespaces(events, sessionId, parentSession) {
 }
 function sourceKey(id) {
     return `${id.thread}\u0000${id.epoch}\u0000${id.ordinal}`;
+}
+/**
+ * Return the seq of the assistant message whose open tool round the retained
+ * tail continues (trailing `tool/result` events directly after an assistant
+ * message), matching `dsh-llm-pi-ai`'s `openToolRoundAssistant`.
+ */
+function openToolRoundAssistantSeq(session, retainedSeqs) {
+    let toolResults = 0;
+    for (let index = retainedSeqs.length - 1; index >= 0; index -= 1) {
+        const seq = retainedSeqs[index];
+        const event = session.eventAt(seq);
+        if (event?.type === "assistant/message") {
+            return toolResults > 0 ? seq : undefined;
+        }
+        if (event?.type !== "tool/result")
+            return undefined;
+        toolResults += 1;
+    }
+    return undefined;
 }
 //# sourceMappingURL=agent.js.map

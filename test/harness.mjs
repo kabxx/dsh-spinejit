@@ -75,7 +75,11 @@ export class ScriptedAdapter extends LlmAdapter {
     }
     if (typeof reply !== "string" && reply.usage !== undefined) yield { type: "usage", usage: reply.usage };
     if (reply.finish === null) return;
-    yield { type: "finish", reason: { kind: reply.finish ?? (text !== undefined ? "stop" : "tool-calls") } };
+    yield {
+      type: "finish",
+      reason: { kind: reply.finish ?? (text !== undefined ? "stop" : "tool-calls") },
+      ...(typeof reply !== "string" && reply.replayState !== undefined ? { replayState: reply.replayState } : {}),
+    };
   }
 }
 
