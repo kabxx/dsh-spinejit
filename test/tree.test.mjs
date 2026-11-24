@@ -5,7 +5,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { pluginRecordOf } from "@deepseek-ai/dsh-session";
-import { formatPrettySpineTreeFromNodes } from "@spinejit/spine-sdk/view";
+import { formatPrettySpineTreeFromNodes, prettySpineTreeLines } from "@spinejit/spine-sdk/view";
 
 import { TreeDisplay, treeProjection } from "../dist/display.js";
 import { TREE_RECORD, treeWindow } from "../dist/tree.js";
@@ -175,19 +175,23 @@ async function loadClient() {
   return { id: loaded.id, client, required, layoutEffects };
 }
 
-test("the client bundle loads in the module loader and draws the whole tree in the dock", async () => {
+async function loadDock(locale = "en") {
   const { id, client, required } = await loadClient();
   assert.equal(id, "@spinejit/dsh-spinejit");
-  assert.deepEqual(required, ["react", "react/jsx-runtime"]);
+  assert.deepEqual([...new Set(required)], ["react", "react/jsx-runtime"]);
   assert.deepEqual(client.inject, ["slots", "uiConversation", "conversation", "locale", "uiSession"]);
   const registered = [];
   const definitions = [];
+  const dictionaries = new Map();
   client.apply({
     slots: { inject: (_name, register) => register(), register: (entry, component) => registered.push([entry, component]) },
     uiConversation: { events: { register: (definition) => { definitions.push(definition); return () => {}; } } },
     conversation: { blocks: {} },
     uiSession: { sessionStatus: { getSnapshot: () => new Map() } },
-    locale: { bind: () => () => "Stop generating", register: () => () => {} },
+    locale: {
+      bind: () => () => "Stop generating",
+      register: (namespace, texts) => { dictionaries.set(namespace, texts); return () => {}; },
+    },
     effect: (execute) => execute(),
   });
   assert.deepEqual(definitions.map(({ kind, target }) => [kind, target]), [
@@ -206,18 +210,113 @@ test("the client bundle loads in the module loader and draws the whole tree in t
   assert.equal(match(developerEvent("spine", [{ type: "text", text: "branch summary" }])), null);
   assert.equal(match(developerEvent("time-context", [])), null);
   const leaves = registered.filter(([entry]) => entry.name === "conversation.input.dock");
-  assert.deepEqual(leaves.map(([entry]) => entry), [{ name: "conversation.input.dock", id: "spinejit", order: 30, registrant: "@spinejit/dsh-spinejit" }]);
-  const Dock = leaves[0][1];
-  assert.equal(Dock({ useProjection: () => undefined }), null);
-  assert.equal(Dock({ useProjection: () => ({ cursor: "1", nodes: [node("1", null, null, "Live", "RootEpoch")] }) }), null);
-  const keys = [];
-  const dock = Dock({ useProjection: (key) => { keys.push(key); return deep; } });
-  assert.deepEqual(keys, ["spinejit"]);
-  const flat = (part) => typeof part === "string" ? part : Array.isArray(part.props.children) ? part.props.children.map(flat).join("") : flat(part.props.children);
-  assert.deepEqual(dock.props.children.map(flat), formatPrettySpineTreeFromNodes(deep.cursor, deep.nodes));
-  const current = dock.props.children[4].props.children[1];
-  assert.equal(current.props.children, "◉");
-  assert.equal(current.props.style.color, "var(--dsw-alias-state-success-primary)");
+  assert.deepEqual(leaves.map(([entry]) => entry), [{ name: "conversation.input.dock", id: "spinejit", order: 19, locale: "spinejit", registrant: id }]);
+  const [entry, Dock] = leaves[0];
+  const t = (key, params) => dictionaries.get(entry.locale)[locale][key].replace("{count}", params?.count);
+  return (tree) => Dock({ useProjection: (key) => { assert.equal(key, "spinejit"); return tree; }, t });
+}
+
+function elements(part, match) {
+  if (Array.isArray(part)) return part.flatMap((child) => elements(child, match));
+  if (part === null || typeof part !== "object") return [];
+  return [...(match(part) ? [part] : []), ...elements(part.props.children, match)];
+}
+
+const withClass = (part, cls) => elements(part, (el) => el.props.className?.split(" ").includes(cls));
+const titles = (part) => withClass(part, "spine-row-title").map((el) => el.props.children);
+
+function spawn(id, parentId, state) {
+  return { ...node(id, parentId, id, "Opened", "Spawn"), spawn: state };
+}
+
+test("the original client loads one localized, collapsible work tree above the composer", async () => {
+  const Dock = await loadDock("zh");
+  assert.equal(Dock(undefined), null);
+  assert.equal(Dock({ cursor: "1", nodes: [node("1", null, null, "Live", "RootEpoch")] }), null);
+  const dock = Dock(deep);
+  assert.equal(dock.type, "details");
+  assert.equal(dock.props.open, undefined, "disclosure starts closed and the browser owns its state");
+  assert.equal(dock.props.children[0].type, "summary");
+  assert.equal(withClass(dock, "spine-title")[0].props.children, "工作树");
+  assert.equal(withClass(dock, "spine-summary-task")[0].props.children, "deep step");
+  assert.deepEqual(titles(dock), ["root task", "first step", "second step", "deep step"]);
+  assert.equal(withClass(dock, "spine-branches").length, 2);
+  const style = elements(dock, (el) => el.type === "style")[0].props.children;
+  const [chevron] = withClass(dock, "spine-chevron");
+  assert.equal(chevron.props["aria-hidden"], true);
+  const arrow = chevron.props.children;
+  assert.equal(arrow.type, "svg");
+  assert.equal(arrow.props.width, 14);
+  assert.equal(arrow.props.height, 14);
+  assert.equal(arrow.props.strokeWidth, 1);
+  assert.equal(arrow.props.stroke, "currentColor");
+  assert.match(style, /:not\(\[open\]\) \.spine-chevron svg \{ transform: rotate\(180deg\); \}/);
+  assert.match(style, /--spine-indent: 18px/);
+  assert.match(style, /max-block-size: 180px/);
+  assert.equal(elements(dock, (el) => el.props["aria-current"] === true).length, 1);
+  assert.equal(withClass(dock, "spine-mark-current")[0].props["aria-label"], "当前");
+  assert.equal(withClass(dock, "spine-mark-complete")[0].props["aria-label"], "已完成");
+});
+
+test("the dock follows the SDK's parallel sibling window and counts only visible pending branches", async () => {
+  const Dock = await loadDock();
+  const chain = ["1", "2", "3", "4", "5", "6"].map((id, index) =>
+    node(id, index === 0 ? null : String(index), `task ${id}`, index === 5 ? "Live" : "Opened"));
+  const pending = Array.from({ length: 5 }, (_, index) => spawn(`parallel ${index}`, "6", "pending"));
+  const hidden = spawn("hidden parallel", "1", "pending");
+  const tree = { cursor: "6", nodes: [...chain, hidden, ...pending] };
+  const dock = Dock(tree);
+  const sdkRows = prettySpineTreeLines(tree.cursor, tree.nodes).slice(1).map((line) =>
+    line.type === "history" ? `${line.count} earlier branches` : line.label);
+  assert.equal(withClass(dock, "spine-title")[0].props.children, "Task tree");
+  assert.deepEqual(titles(dock), sdkRows);
+  assert.deepEqual(titles(dock).slice(-4), ["2 earlier branches", "parallel 2", "parallel 3", "parallel 4"]);
+  assert.equal(withClass(dock, "spine-summary-status")[0].props.children, "\u2002·\u20023 parallel branches");
+  assert.equal(withClass(dock, "spine-mark-parallel").length, 3);
+  assert.equal(titles(dock).includes("hidden parallel"), false);
+  assert.equal(withClass(Dock({ cursor: "6", nodes: [...chain, hidden] }), "spine-summary-status").length, 0);
+});
+
+test("a wide tree preserves sibling order and indexes children once", async () => {
+  const Dock = await loadDock();
+  const root = node("root", null, "work", "Live");
+  const siblings = Array.from({ length: 400 }, (_, index) => node(`task-${index}`, "root", `task ${index}`, "Closed"));
+  const expected = ["work", "397 earlier branches", "task 397", "task 398", "task 399"];
+  let parentReads = 0;
+  const observed = siblings.map((sibling) => ({
+    ...sibling,
+    get parentId() {
+      parentReads += 1;
+      return sibling.parentId;
+    },
+  }));
+  assert.deepEqual(titles(Dock({ cursor: "root", nodes: [root, ...observed] })), expected);
+  assert.ok(parentReads <= siblings.length * 3, `expected linear parent lookups, observed ${parentReads}`);
+});
+
+test("parallel results use distinct static icons and earlier branches still fold", async () => {
+  const Dock = await loadDock();
+  const root = node("1", null, "work", "Live");
+  const outcomes = [
+    ["completed", "complete", "Completed", ["M5 12l5 5l10 -10"]],
+    ["errored", "error", "Failed", ["M18 6l-12 12", "M6 6l12 12"]],
+    ["aborted", "aborted", "Aborted", ["M12 19v.01", "M12 15v-10"]]
+  ];
+  for (const [arrived, mark, label, paths] of outcomes) {
+    const dock = Dock({ cursor: "1", nodes: [root, spawn("check", "1", { arrived })] });
+    assert.equal(withClass(dock, "spine-mark-parallel").length, 0);
+    const [indicator] = withClass(dock, `spine-mark-${mark}`);
+    assert.equal(indicator.props["aria-label"], label);
+    assert.equal(indicator.props.children.type, "svg");
+    assert.deepEqual(elements(indicator, (el) => el.type === "path").map((el) => el.props.d), paths);
+    assert.equal(withClass(indicator, "spine-spinner").length, 0);
+    assert.equal(withClass(dock, "spine-mark-current").flatMap((el) => withClass(el, "spine-spinner")).length, 1);
+  }
+  const epoch = node("1", null, null, "Live", "RootEpoch");
+  const done = ["one", "two", "three"].map((name) => node(name, "1", name, "Closed"));
+  const dock = Dock({ cursor: "1", nodes: [epoch, spawn("old error", "1", { arrived: "errored" }), spawn("old abort", "1", { arrived: "aborted" }), ...done] });
+  assert.equal(withClass(dock, "spine-summary").length, 0);
+  assert.deepEqual(titles(dock), ["2 earlier branches", "one", "two", "three"]);
 });
 
 test("only Spine spawn sessions restrict the native composer controls", async () => {

@@ -1,10 +1,7 @@
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
 import { compactStatsDefinition } from "./compact-stats.js";
-import { TREE_PROJECTION, type SpineTree } from "./tree.js";
-/** The dock seat's props the entry reads. */
-export interface SpineDockProps {
-    useProjection(key: typeof TREE_PROJECTION): SpineTree | null | undefined;
-}
+import { worktreeText, type SpineDockProps } from "./worktree.js";
+export { SpineDock, type SpineDockProps } from "./worktree.js";
 interface ComposerBlock {
     readonly reason: string;
 }
@@ -47,6 +44,7 @@ interface Slots {
         name: "conversation.input.dock";
         id: string;
         order: number;
+        locale: string;
         registrant: string;
     }, component: (props: SpineDockProps) => unknown): unknown;
     register(entry: {
@@ -91,11 +89,8 @@ export declare function apply(ctx: {
     uiSession: SessionStatus;
     locale: {
         bind(namespace: "conversation"): (key: "input.stop") => string;
-        register(namespace: typeof SPAWN_LOCALE, dictionaries: typeof SPAWN_COPY): () => void;
+        register(namespace: string, dictionaries: typeof worktreeText | typeof SPAWN_COPY): () => void;
     };
     effect(execute: () => () => void, label?: string): unknown;
 }): void;
-/** Hook-free but for `useProjection`, so the dock can also call it as a plain function. */
-export declare function SpineDock({ useProjection }: SpineDockProps): unknown;
-export {};
 //# sourceMappingURL=client.d.ts.map

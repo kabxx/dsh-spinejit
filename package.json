@@ -35,7 +35,9 @@
     "./client": {
       "types": "./dist/client.d.ts",
       "default": "./dist/client.js"
-    }
+    },
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "dsh": {
     "bundle": {
@@ -56,6 +58,7 @@
     "README.md",
     "NOTICE",
     "icon.svg",
+    "locale/*.json",
     "locale/compact/*.json",
     "cordis.patch.yml",
     "presets/web-compaction.patch.yml",

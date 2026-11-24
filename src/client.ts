@@ -1,28 +1,17 @@
-// The browser half: the Spine tree in the conversation's input dock, drawn
-// whole as Pi draws it, from the session's "spinejit" projection that the host
-// folds from the tree records. scripts/build-client.mjs bundles it into
+// The browser entry registers the work tree in the input dock and hides
+// Spine's empty context markers. scripts/build-client.mjs bundles it into
 // dist/client.js, the client module the DSH web client loads.
 import type { SessionEvent } from "@deepseek-ai/dsh-session";
 import { useLayoutEffect, useRef } from "react";
-import { jsx, jsxs } from "react/jsx-runtime";
-import {
-  prettySpineTreeLines,
-  prettySpineTreeLineText,
-  spineTreeMarkerTone,
-  type PrettySpineTreeLine,
-  type SpineTreeMarkerTone,
-} from "@spinejit/spine-sdk/view";
+import { jsx } from "react/jsx-runtime";
 
 import { compactStatsDefinition } from "./compact-stats.js";
 import { spawnIdentity } from "./spawn-id.js";
-import { showsTree, TREE_PROJECTION, type SpineTree } from "./tree.js";
+import { SpineDock, worktreeText, type SpineDockProps } from "./worktree.js";
 
-type Style = Record<string, string | number>;
+export { SpineDock, type SpineDockProps } from "./worktree.js";
 
-/** The dock seat's props the entry reads. */
-export interface SpineDockProps {
-  useProjection(key: typeof TREE_PROJECTION): SpineTree | null | undefined;
-}
+const LOCALE = "spinejit";
 
 interface ComposerBlock {
   readonly reason: string;
@@ -54,7 +43,7 @@ const SPAWN_COPY = {
 interface Slots {
   inject(name: "conversation.input.dock" | "conversation.composer.dock", register: () => unknown): unknown;
   register(
-    entry: { name: "conversation.input.dock"; id: string; order: number; registrant: string },
+    entry: { name: "conversation.input.dock"; id: string; order: number; locale: string; registrant: string },
     component: (props: SpineDockProps) => unknown,
   ): unknown;
   register(
@@ -98,12 +87,13 @@ export function apply(ctx: {
   uiSession: SessionStatus;
   locale: {
     bind(namespace: "conversation"): (key: "input.stop") => string;
-    register(namespace: typeof SPAWN_LOCALE, dictionaries: typeof SPAWN_COPY): () => void;
+    register(namespace: string, dictionaries: typeof worktreeText | typeof SPAWN_COPY): () => void;
   };
   effect(execute: () => () => void, label?: string): unknown;
 }): void {
   const { blocks } = ctx.conversation;
   const conversationText = ctx.locale.bind("conversation");
+  ctx.effect(() => ctx.locale.register(LOCALE, worktreeText), "spinejit: work tree locale");
   ctx.effect(() => ctx.uiConversation.events.register(emptySpineContextDefinition), "spinejit: hide empty context");
   ctx.effect(() => ctx.uiConversation.events.register(compactStatsDefinition), "spinejit: compact statistics");
   ctx.effect(() => ctx.locale.register(SPAWN_LOCALE, SPAWN_COPY), "spinejit: child composer copy");
@@ -138,13 +128,13 @@ export function apply(ctx: {
   }));
   ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
     name: "conversation.input.dock",
-    // After the official entries: todo 0, goal 10, activity 15, queue 20.
+    // Between the official Goal (10) and queue (20) entries.
     id: "spinejit",
-    order: 30,
+    order: 19,
+    locale: LOCALE,
     registrant: "@spinejit/dsh-spinejit",
   }, SpineDock));
 }
-
 // The native composer owns the button. Scope its inert state to the card next
 // to this dock, using the button's localized accessible name.
 function stopButtonCss(label: string): string {
@@ -192,50 +182,4 @@ function holdComposerBlock(blocks: ComposerBlocks, sessionId: string, reason: st
     unsubscribe();
     if (store.getSnapshot() === block) blocks.set(sessionId, undefined);
   };
-}
-// Sized to the composer card, as the official dock rows are.
-const BLOCK: Style = {
-  boxSizing: "border-box",
-  width: "100%",
-  maxWidth: "var(--dsh-composer-card-max-width)",
-  margin: "0 auto",
-  padding: "4px 16px 0",
-  fontFamily: "var(--dsw-font-mono, monospace)",
-  fontSize: 12,
-  lineHeight: "18px",
-  color: "var(--dsw-alias-label-secondary)",
-};
-const ROW: Style = { whiteSpace: "pre", overflow: "hidden", textOverflow: "ellipsis" };
-const DIM: Style = { color: "var(--dsw-alias-label-tertiary)" };
-const TONE: Record<SpineTreeMarkerTone, Style> = {
-  brand: { color: "var(--dsw-alias-state-success-primary)", fontWeight: 600 },
-  error: { color: "var(--dsw-alias-state-error-primary)", fontWeight: 600 },
-  warning: { color: "var(--dsw-alias-state-warn-primary)", fontWeight: 600 },
-  dim: DIM,
-};
-
-/** Hook-free but for `useProjection`, so the dock can also call it as a plain function. */
-export function SpineDock({ useProjection }: SpineDockProps): unknown {
-  const tree = useProjection(TREE_PROJECTION);
-  if (!showsTree(tree)) return null;
-  return jsx("div", {
-    style: BLOCK,
-    children: prettySpineTreeLines(tree.cursor, tree.nodes).map((line, index) =>
-      jsxs("div", { style: ROW, children: rowParts(line) }, index)),
-  });
-}
-
-function rowParts(line: PrettySpineTreeLine): unknown[] {
-  switch (line.type) {
-    case "header":
-      return [span(DIM, "• "), span(TONE.brand, "Spine Tree")];
-    case "node":
-      return [span(DIM, line.prefix), span(TONE[spineTreeMarkerTone(line.marker)], line.marker), ` ${line.label}`];
-    default:
-      return [span(DIM, prettySpineTreeLineText(line))];
-  }
-}
-
-function span(style: Style, text: string): unknown {
-  return jsx("span", { style, children: text });
 }
