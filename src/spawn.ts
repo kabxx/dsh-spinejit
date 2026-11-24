@@ -17,6 +17,7 @@ import {
 
 import type { SpineAgent } from "./agent.js";
 import { sourceCharacter, surfaceRole } from "./events.js";
+import { spawnIdentity } from "./spawn-id.js";
 
 /** The subagent provider every Spawn child runs under. */
 export const SPINE_SUBAGENT_PROVIDER = "spine";
@@ -39,8 +40,7 @@ export function childSessionId(parent: string, producer: readonly number[]): Ses
 
 /** The birth a session runs, read back from its childSessionId; null for a session that is not a Spawn child. */
 export function sessionBirth(id: string): number[] | null {
-  const match = /:spawn:(\d+(?:\.\d+)*)$/.exec(id);
-  return match === null ? null : match[1]!.split(".").map(Number);
+  return spawnIdentity(id)?.producer ?? null;
 }
 
 /**

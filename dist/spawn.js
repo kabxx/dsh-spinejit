@@ -2,6 +2,7 @@ import { addAbortListener } from "node:events";
 import { buildForkSeed, isAppendSurfaceEvent, SessionId, SessionSeq } from "@deepseek-ai/dsh-session";
 import { childState, spineChildAssignmentText, toArrival, } from "@spinejit/spine-sdk/host";
 import { sourceCharacter, surfaceRole } from "./events.js";
+import { spawnIdentity } from "./spawn-id.js";
 /** The subagent provider every Spawn child runs under. */
 export const SPINE_SUBAGENT_PROVIDER = "spine";
 /** A child's session id: fixed by its parent session and birth, so a restarted parent finds it. */
@@ -10,8 +11,7 @@ export function childSessionId(parent, producer) {
 }
 /** The birth a session runs, read back from its childSessionId; null for a session that is not a Spawn child. */
 export function sessionBirth(id) {
-    const match = /:spawn:(\d+(?:\.\d+)*)$/.exec(id);
-    return match === null ? null : match[1].split(".").map(Number);
+    return spawnIdentity(id)?.producer ?? null;
 }
 /**
  * A child's own log, the events after its inherited prefix, as the Spawn end

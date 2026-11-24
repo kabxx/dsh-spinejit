@@ -28,6 +28,7 @@ __export(client_exports, {
   inject: () => inject
 });
 module.exports = __toCommonJS(client_exports);
+var import_react = require("react");
 var import_jsx_runtime = require("react/jsx-runtime");
 
 // node_modules/@spinejit/spine-sdk/dist/view/tree-style.js
@@ -365,6 +366,14 @@ var compactStatsDefinition = {
   }
 };
 
+// src/spawn-id.ts
+var SPAWN_SUFFIX = /:spawn:(\d+(?:\.\d+)*)$/;
+function spawnIdentity(id) {
+  const match = SPAWN_SUFFIX.exec(id);
+  if (match === null) return null;
+  return { parent: id.slice(0, match.index), producer: match[1].split(".").map(Number) };
+}
+
 // src/tree.ts
 var TREE_PROJECTION = "spinejit";
 function showsTree(tree) {
@@ -372,6 +381,11 @@ function showsTree(tree) {
 }
 
 // src/client.ts
+var SPAWN_LOCALE = "spinejit-spawn";
+var SPAWN_COPY = {
+  en: { placeholder: "Send messages from the parent conversation" },
+  zh: { placeholder: "\u8BF7\u5728\u7236\u4F1A\u8BDD\u53D1\u9001\u6D88\u606F" }
+};
 var emptySpineContextDefinition = {
   kind: "spinejit.empty-context",
   target: "chat",
@@ -386,10 +400,41 @@ var emptySpineContextDefinition = {
   update: () => null,
   buildViewNode: () => null
 };
-var inject = ["slots", "uiConversation"];
+var inject = ["slots", "uiConversation", "conversation", "locale", "uiSession"];
 function apply(ctx) {
+  const { blocks } = ctx.conversation;
+  const conversationText = ctx.locale.bind("conversation");
   ctx.effect(() => ctx.uiConversation.events.register(emptySpineContextDefinition), "spinejit: hide empty context");
   ctx.effect(() => ctx.uiConversation.events.register(compactStatsDefinition), "spinejit: compact statistics");
+  ctx.effect(() => ctx.locale.register(SPAWN_LOCALE, SPAWN_COPY), "spinejit: child composer copy");
+  ctx.slots.inject("conversation.composer.dock", () => ctx.slots.register({
+    name: "conversation.composer.dock",
+    id: "spinejit.spawn-send-block",
+    locale: SPAWN_LOCALE
+  }, function SpineSpawnSendBlock({ sessionId, useSession, t }) {
+    const spawned = useSession((session) => {
+      const address = session.subagent?.address;
+      return address?.mode === "continuable" && address.childSessionId === sessionId && spawnIdentity(address.childSessionId)?.parent === address.parentSessionId;
+    });
+    const running = useSession((session) => session.running === true && session.removed !== true);
+    const styleRef = (0, import_react.useRef)(null);
+    const reason = t("placeholder");
+    (0, import_react.useLayoutEffect)(() => {
+      if (!spawned) return;
+      return holdComposerBlock(blocks, sessionId, reason);
+    }, [sessionId, spawned, reason]);
+    (0, import_react.useLayoutEffect)(() => {
+      if (spawned && running && styleRef.current !== null) {
+        return suppressStopShortcut(styleRef.current, sessionId, ctx.uiSession);
+      }
+    }, [sessionId, spawned, running]);
+    if (!spawned) return null;
+    return (0, import_jsx_runtime.jsx)("style", {
+      ref: styleRef,
+      "data-spinejit-child-stop": "",
+      children: stopButtonCss(conversationText("input.stop"))
+    });
+  }));
   ctx.slots.inject("conversation.input.dock", () => ctx.slots.register({
     name: "conversation.input.dock",
     // After the official entries: todo 0, goal 10, activity 15, queue 20.
@@ -397,6 +442,43 @@ function apply(ctx) {
     order: 30,
     registrant: "@spinejit/dsh-spinejit"
   }, SpineDock));
+}
+function stopButtonCss(label) {
+  const escaped = Array.from(label, (char) => `\\${char.codePointAt(0).toString(16)} `).join("");
+  const stop = `:has(> [data-composer-dock] [data-spinejit-child-stop]) > [data-composer-card] button[aria-label="${escaped}"]:not([data-slot^="conversation.input."] *)`;
+  return `
+${stop} { pointer-events: none; visibility: hidden; }
+@supports (interactivity: inert) {
+  ${stop} { interactivity: inert; visibility: visible; opacity: 0.4; }
+}`;
+}
+function suppressStopShortcut(seat, sessionId, uiSession) {
+  const occurrence = seat.closest("[data-conversation-session]");
+  if (occurrence?.dataset.conversationSession !== sessionId) return;
+  const document = seat.ownerDocument;
+  const keydown = (event) => {
+    if (event.code !== "Escape" || event.defaultPrevented || event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.shiftKey || event.metaKey || event.keyCode === 229) return;
+    const target = event.composedPath().find((node) => node instanceof Element);
+    if (!target || target.closest("[data-conversation-session]") !== occurrence) return;
+    const region = target.closest("[data-conversation-region]");
+    if (!region || !occurrence.contains(region) || target.closest("[data-approval-key], [data-question-key], iframe, .xterm, [inert]") || uiSession.sessionStatus.getSnapshot().get(sessionId)?.pendingInteraction !== void 0 || document.querySelector('[role="dialog"][aria-modal="true"], [role="menu"]')) return;
+    event.preventDefault();
+  };
+  document.addEventListener("keydown", keydown);
+  return () => document.removeEventListener("keydown", keydown);
+}
+function holdComposerBlock(blocks, sessionId, reason) {
+  const block = { reason };
+  const store = blocks.storeFor(sessionId);
+  const apply2 = () => {
+    if (store.getSnapshot() === void 0) blocks.set(sessionId, block);
+  };
+  const unsubscribe = store.subscribe(apply2);
+  apply2();
+  return () => {
+    unsubscribe();
+    if (store.getSnapshot() === block) blocks.set(sessionId, void 0);
+  };
 }
 var BLOCK = {
   boxSizing: "border-box",
