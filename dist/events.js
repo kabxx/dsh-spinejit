@@ -2,6 +2,7 @@ import { createDeveloperMessage, createUserMessage, lastAssistantStreamChunk, } 
 import { isAppendSurfaceEvent } from "@deepseek-ai/dsh-session";
 import { spineArrivalText } from "@spinejit/spine-sdk/host";
 import { withoutAnchor } from "./anchors.js";
+import { COMPACT_CHECKPOINT_PREFIX } from "./compact-format.js";
 export class SpineDshError extends Error {
     constructor(message, options) {
         super(message, options);
@@ -38,12 +39,12 @@ export function isUserSource(event) {
     return event.type === "user/message" && event.data.source.kind === "user";
 }
 /**
- * What the Spine core observes for one source event; the boundary is the event
- * seq. `anchorInText`: a user message logged by 0.1.1 or earlier, whose text
- * starts with its own `[U<n>]`; the core sees it without the number.
+ * What the Spine core observes for one source event; the boundary defaults to
+ * the event seq, shifted when an earlier compaction retained trailing sources.
+ * `anchorInText`: a user message logged by 0.1.1 or earlier, whose text starts
+ * with its own `[U<n>]`; the core sees it without the number.
  */
-export function sourceCharacter(event, anchorInText = false) {
-    const boundary = event.seq;
+export function sourceCharacter(event, anchorInText = false, boundary = event.seq) {
     if (event.type === "tool/result")
         return { type: "opaque", boundary };
     const arrival = arrivalOf(event);
@@ -90,6 +91,42 @@ export function arrivalOf(event) {
         return null;
     const source = event.data.source;
     return source.kind === "spine-arrival" ? source.arrival : null;
+}
+/** One durable event holds both the epoch barrier and its model-visible replacement. */
+export function compactMessage(barrier, summary, metadata) {
+    const retainedSeqs = metadata?.retainedSeqs;
+    const droppedReasoningSeqs = metadata?.droppedReasoningSeqs;
+    return createUserMessage({
+        content: [{ type: "text", text: `${COMPACT_CHECKPOINT_PREFIX}${summary.text}` }],
+        source: {
+            kind: "spine-compact",
+            barrier,
+            calls: summary.calls,
+            ...(retainedSeqs !== undefined && retainedSeqs.length > 0 ? { retainedSeqs: [...retainedSeqs] } : {}),
+            ...(droppedReasoningSeqs !== undefined
+                ? { droppedReasoningSeqs: [...droppedReasoningSeqs] }
+                : {}),
+            ...(metadata?.trigger === undefined ? {} : { trigger: metadata.trigger }),
+            ...(metadata?.turn === undefined ? {} : { turn: metadata.turn }),
+            ...(metadata?.shadowedTokens === undefined ? {} : { shadowedTokens: metadata.shadowedTokens }),
+        },
+    });
+}
+export function compactBarrierOf(event) {
+    return event.type === "user/message" && event.data.source.kind === "spine-compact"
+        ? event.data.source.barrier : undefined;
+}
+export function compactRetainedSeqsOf(event) {
+    if (event.type !== "user/message" || event.data.source.kind !== "spine-compact")
+        return [];
+    return event.data.source.retainedSeqs ?? [];
+}
+export function compactDroppedReasoningSeqsOf(event) {
+    if (event.type !== "user/message" || event.data.source.kind !== "spine-compact")
+        return undefined;
+    return Array.isArray(event.data.source.droppedReasoningSeqs)
+        ? event.data.source.droppedReasoningSeqs
+        : undefined;
 }
 /** A Spine item (node descriptor, memory, birth) as a model-visible user message. */
 export function spineMessage(text) {

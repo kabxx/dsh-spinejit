@@ -1,0 +1,6 @@
+The plugin icon is adapted from the SpineCodex tree artwork:
+https://github.com/GhabiX/SpineCodex/blob/d90a466a10c7b8c3ca492a827222b164bd78af52/.github/assets/spinecodex-tree.svg
+
+The artwork is distributed under the Apache License, Version 2.0. See LICENSE.
+The adaptation removes three decorative ground strokes and adds transparent
+padding for display in the plugin list.

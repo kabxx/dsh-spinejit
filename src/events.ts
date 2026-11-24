@@ -5,13 +5,17 @@ import {
   type ContentBlock,
   type DeveloperMessage,
   type Message,
+  type TokenUsage,
   type UserMessage,
 } from "@deepseek-ai/dsh-llm";
-import { isAppendSurfaceEvent, type SessionEvent } from "@deepseek-ai/dsh-session";
-import type { SourceCharacter, SpawnArrival } from "@spinejit/spine-sdk";
+import { isAppendSurfaceEvent, type SessionEvent, type SessionSeq } from "@deepseek-ai/dsh-session";
+import type { CompactBarrier, SourceCharacter, SpawnArrival } from "@spinejit/spine-sdk";
 import { spineArrivalText } from "@spinejit/spine-sdk/host";
 
 import { withoutAnchor } from "./anchors.js";
+import { COMPACT_CHECKPOINT_PREFIX } from "./compact-format.js";
+
+export type CompactTrigger = "manual" | "pressure" | "model-switch" | "context-overflow";
 
 declare module "@deepseek-ai/dsh-llm" {
   interface MessageSourceMap {
@@ -22,7 +26,28 @@ declare module "@deepseek-ai/dsh-llm" {
     spine: { kind: "spine"; sampling?: true };
     /** A Spawn child's result, delivered to the session that bore it. */
     "spine-arrival": { kind: "spine-arrival"; arrival: SpawnArrival };
+    "spine-compact": {
+      kind: "spine-compact";
+      barrier: CompactBarrier;
+      calls?: CompactCall[];
+      retainedSeqs?: SessionSeq[];
+      droppedReasoningSeqs?: SessionSeq[];
+      trigger?: CompactTrigger;
+      turn?: number;
+      shadowedTokens?: number;
+    };
   }
+}
+
+export interface CompactCall {
+  provider: string;
+  model: string;
+  usage?: TokenUsage;
+}
+
+export interface CompactSummary {
+  text: string;
+  calls: CompactCall[];
 }
 
 /**
@@ -71,12 +96,16 @@ export function isUserSource(event: SessionEvent): boolean {
 }
 
 /**
- * What the Spine core observes for one source event; the boundary is the event
- * seq. `anchorInText`: a user message logged by 0.1.1 or earlier, whose text
- * starts with its own `[U<n>]`; the core sees it without the number.
+ * What the Spine core observes for one source event; the boundary defaults to
+ * the event seq, shifted when an earlier compaction retained trailing sources.
+ * `anchorInText`: a user message logged by 0.1.1 or earlier, whose text starts
+ * with its own `[U<n>]`; the core sees it without the number.
  */
-export function sourceCharacter(event: SessionEvent, anchorInText = false): SourceCharacter {
-  const boundary = event.seq;
+export function sourceCharacter(
+  event: SessionEvent,
+  anchorInText = false,
+  boundary: number = event.seq,
+): SourceCharacter {
   if (event.type === "tool/result") return { type: "opaque", boundary };
   const arrival = arrivalOf(event);
   if (arrival !== null) return { type: "arrival", boundary, arrival };
@@ -125,6 +154,56 @@ export function arrivalOf(event: SessionEvent): SpawnArrival | null {
   if (event.type !== "user/message") return null;
   const source = event.data.source;
   return source.kind === "spine-arrival" ? source.arrival : null;
+}
+
+export interface CompactMessageMetadata {
+  readonly retainedSeqs?: readonly SessionSeq[];
+  readonly droppedReasoningSeqs?: readonly SessionSeq[];
+  readonly trigger?: CompactTrigger;
+  readonly turn?: number;
+  readonly shadowedTokens?: number;
+}
+
+/** One durable event holds both the epoch barrier and its model-visible replacement. */
+export function compactMessage(
+  barrier: CompactBarrier,
+  summary: CompactSummary,
+  metadata?: CompactMessageMetadata,
+): UserMessage {
+  const retainedSeqs = metadata?.retainedSeqs;
+  const droppedReasoningSeqs = metadata?.droppedReasoningSeqs;
+  return createUserMessage({
+    content: [{ type: "text", text: `${COMPACT_CHECKPOINT_PREFIX}${summary.text}` }],
+    source: {
+      kind: "spine-compact",
+      barrier,
+      calls: summary.calls,
+      ...(retainedSeqs !== undefined && retainedSeqs.length > 0 ? { retainedSeqs: [...retainedSeqs] } : {}),
+      ...(droppedReasoningSeqs !== undefined
+        ? { droppedReasoningSeqs: [...droppedReasoningSeqs] }
+        : {}),
+      ...(metadata?.trigger === undefined ? {} : { trigger: metadata.trigger }),
+      ...(metadata?.turn === undefined ? {} : { turn: metadata.turn }),
+      ...(metadata?.shadowedTokens === undefined ? {} : { shadowedTokens: metadata.shadowedTokens }),
+    },
+  });
+}
+
+export function compactBarrierOf(event: SessionEvent): CompactBarrier | undefined {
+  return event.type === "user/message" && event.data.source.kind === "spine-compact"
+    ? event.data.source.barrier : undefined;
+}
+
+export function compactRetainedSeqsOf(event: SessionEvent): readonly SessionSeq[] {
+  if (event.type !== "user/message" || event.data.source.kind !== "spine-compact") return [];
+  return event.data.source.retainedSeqs ?? [];
+}
+
+export function compactDroppedReasoningSeqsOf(event: SessionEvent): readonly SessionSeq[] | undefined {
+  if (event.type !== "user/message" || event.data.source.kind !== "spine-compact") return undefined;
+  return Array.isArray(event.data.source.droppedReasoningSeqs)
+    ? event.data.source.droppedReasoningSeqs
+    : undefined;
 }
 
 /** A Spine item (node descriptor, memory, birth) as a model-visible user message. */

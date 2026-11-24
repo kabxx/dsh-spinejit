@@ -9,7 +9,7 @@ import type { ToolDefinition } from "@deepseek-ai/dsh-tools";
 import { isSpineToolName, loadSpineConfigToml, SpawnChildren, toArrival } from "@spinejit/spine-sdk/host";
 import { createNodeSpineRuntime, type SpineToolSpec } from "@spinejit/spine-sdk/node";
 
-import { SPINE_FEATURES, SpineAgent } from "./agent.js";
+import { SPINE_ATTACHMENT, SPINE_FEATURES, SpineAgent, type SpineAttachment } from "./agent.js";
 import { userAnchorsProjection } from "./anchors.js";
 import { TreeDisplay, treeProjection } from "./display.js";
 import { arrivalMessage, SpineDshError } from "./events.js";
@@ -311,6 +311,7 @@ export function apply(ctx: Context): void {
     saving.set(agent, scheduled);
   }
 
+  ctx.reflect.provide(SPINE_ATTACHMENT, { ensure: attachAgent, signal: lifetime.signal } satisfies SpineAttachment);
   ctx.on("agent/created", async ({ agent }) => {
     const spine = await attachAgent(agent);
     scheduleCheckpoint(agent, spine);

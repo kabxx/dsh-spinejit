@@ -4,10 +4,13 @@ import type { PlanItem } from "./projection.js";
 import type { SpineProjection } from "@spinejit/spine-sdk";
 export interface HostCheckpoint {
     sourceSeqs: [string, SessionSeq][];
+    boundarySeqs?: [number, SessionSeq][];
+    boundaryOffset?: number;
     userNumbers: [SessionSeq, number][];
     anchored: SessionSeq[];
     anchorInText: SessionSeq[];
     entered: string[];
+    compactDroppedReasoning?: SessionSeq[];
     plan: PlanItem[] | null;
     projection: SpineProjection | null;
 }

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-spinejit/compact",
+    "description": "为 SpineJIT 提供 /compact（/压缩）命令，将当前对话总结为摘要并在后续对话中开启新的工作树。"
+  }
+}

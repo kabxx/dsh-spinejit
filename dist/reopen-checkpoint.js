@@ -19,7 +19,7 @@ function hostBuildId() {
     if (hostBuild !== undefined)
         return hostBuild;
     const hash = createHash("sha256");
-    for (const name of ["index", "agent", "anchors", "events", "projection", "reasoning", "spawn", "reopen-checkpoint"]) {
+    for (const name of ["index", "agent", "anchors", "compact-range", "events", "projection", "reasoning", "spawn", "reopen-checkpoint"]) {
         hash.update(name).update(readFileSync(new URL(`./${name}.js`, import.meta.url)));
     }
     for (const specifier of ["@deepseek-ai/dsh-session", "@deepseek-ai/dsh-llm", "@spinejit/spine-sdk/host"]) {
@@ -40,8 +40,12 @@ const envelope = z.object({
 });
 const payloadSchema = z.object({
     sdk: z.string(), host: z.object({
-        sourceSeqs: textSeq, userNumbers: z.array(z.tuple([nonnegative, nonnegative])),
+        sourceSeqs: textSeq,
+        boundarySeqs: z.array(z.tuple([nonnegative, nonnegative])).optional(),
+        boundaryOffset: nonnegative.optional(),
+        userNumbers: z.array(z.tuple([nonnegative, nonnegative])),
         anchored: seqs, anchorInText: seqs, entered: z.array(z.string()),
+        compactDroppedReasoning: seqs.optional(),
         plan: z.array(planItem).nullable(), projection: z.record(z.string(), z.unknown()).nullable(),
     }),
 });
