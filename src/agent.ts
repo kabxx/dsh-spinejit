@@ -1,3 +1,4 @@
+import { setImmediate as yieldToLoop } from "node:timers/promises";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { isAppendSurfaceEvent, pluginRecordOf, type SessionEvent, type SessionSeq } from "@deepseek-ai/dsh-session";
 import type { EpochOrdinalId, FeatureFlag, SpineProjection, Terminal } from "@spinejit/spine-sdk";
@@ -12,7 +13,6 @@ import {
   type SpineHostAdapter,
   type SpineToolName,
 } from "@spinejit/spine-sdk/host";
-import { createNodeSpineRuntime } from "@spinejit/spine-sdk/node";
 
 import { anchorPrefix, firstText, hasRepairedInlineAnchor, logAnchors, USER_ANCHORS, type UserAnchor } from "./anchors.js";
 import {
@@ -28,6 +28,8 @@ import {
   spineText,
   surfaceRole,
 } from "./events.js";
+import { checkpointBuild, createCheckpointNodeRuntime } from "./checkpoint-runtime.js";
+import { LatestCheckpoint, type HostCheckpoint } from "./reopen-checkpoint.js";
 import { applySurfaceEdits, planItems, surfaceEdits, type PlanItem, type SurfaceNode } from "./projection.js";
 import { dropReasoning, hasReasoning } from "./reasoning.js";
 import { sessionBirth } from "./spawn.js";
@@ -87,6 +89,9 @@ export class SpineAgent {
   readonly #born: BirthHandler;
   readonly #changed: ProjectionHandler;
   #adapter!: SpineHostAdapter;
+  #runtime!: ReturnType<typeof createCheckpointNodeRuntime>;
+  #checkpoint!: LatestCheckpoint;
+  readonly #checkpointLifetime = new AbortController();
   /** Every session event seen, by seq. */
   readonly #events = new Map<number, SessionEvent>();
   /** Logged sources the core has not observed yet, in log order. */
@@ -102,6 +107,9 @@ export class SpineAgent {
   /** Births whose arrival is in the log, by producer. */
   readonly #entered = new Set<string>();
   #recovering = false;
+  // A preview at the end of recovery can expose pending input before its
+  // next recorded sampling. That preview is not a reusable replay boundary.
+  #recoveryPreview = false;
   #sampling: Sampling | null = null;
   #turn = 0;
   #step = 0;
@@ -119,37 +127,151 @@ export class SpineAgent {
     configToml: string,
     born: BirthHandler,
     changed: ProjectionHandler,
+    storage: ConstructorParameters<typeof LatestCheckpoint>[1],
+    signal: AbortSignal,
   ): Promise<SpineAgent> {
+    signal.throwIfAborted();
     const events = agent.session.snapshotEvents();
     const { thread, continuations } = forkNamespaces(events, agent.id, agent.session.header.parentSession);
-    const runtime = createNodeSpineRuntime({ thread, features: SPINE_FEATURES, configToml });
-    const spine = new SpineAgent(agent, runtime.nodePrompt(), born, changed);
-    spine.#adapter = await createHostAdapter<PlanItem>({
-      runtime: runtime.client,
-      host: {
-        // DSH has no ownership registry. Another writer that rewrites conversation
-        // context moves a plan source off the surface, and the projection faults.
-        claimOwnership: async () => {},
-        // Every fact a commit derives from is already in the session log.
-        persistArchive: async () => {},
-        context: {
-          materialize: async (context) => planItems(context, (id) => spine.#seqOf(id)),
-          publishAtomic: async (context) => {
-            spine.#plan = [...context.messages];
-            spine.#project(context.projection);
-          },
-        },
-      },
-      dispose: () => runtime.dispose(),
-    });
-    // A resumed session brings its log as seed events, which are never published.
+    const checkpoint = new LatestCheckpoint(agent, storage, checkpointBuild(), configToml);
+    const cached = await checkpoint.read(events, signal);
+    signal.throwIfAborted();
+    if (cached !== undefined) {
+      const spine = await SpineAgent.#initialize(agent, agent.id, configToml, born, changed);
+      try {
+        signal.throwIfAborted();
+        await spine.#runtime.importCheckpoint(cached.sdk);
+        signal.throwIfAborted();
+        spine.#installCheckpoint(events.slice(0, cached.through + 1), cached.host);
+        await spine.#recover(events.slice(cached.through + 1), continuations, signal);
+        signal.throwIfAborted();
+        checkpoint.markRestored(cached.through);
+        spine.#checkpoint = checkpoint;
+        return spine;
+      } catch {
+        spine.dispose();
+        signal.throwIfAborted();
+      }
+    }
+    signal.throwIfAborted();
+    const spine = await SpineAgent.#initialize(agent, thread, configToml, born, changed);
+    spine.#checkpoint = checkpoint;
     try {
-      await spine.#recover(events, continuations);
+      await spine.#recover(events, continuations, signal);
+      signal.throwIfAborted();
     } catch (error) {
       spine.dispose();
       throw error;
     }
     return spine;
+  }
+
+  static async #initialize(
+    agent: Agent,
+    thread: string,
+    configToml: string,
+    born: BirthHandler,
+    changed: ProjectionHandler,
+  ): Promise<SpineAgent> {
+    const runtime = createCheckpointNodeRuntime({ thread, features: SPINE_FEATURES, configToml });
+    const spine = new SpineAgent(agent, runtime.nodePrompt(), born, changed);
+    spine.#runtime = runtime;
+    try {
+      spine.#adapter = await createHostAdapter<PlanItem>({
+        runtime: runtime.client,
+        host: {
+          // DSH has no ownership registry. Another writer that rewrites conversation
+          // context moves a plan source off the surface, and the projection faults.
+          claimOwnership: async () => {},
+          // Every fact a commit derives from is already in the session log.
+          persistArchive: async () => {},
+          context: {
+            materialize: async (context) => planItems(context, (id) => spine.#seqOf(id)),
+            publishAtomic: async (context) => {
+              spine.#plan = [...context.messages];
+              spine.#project(context.projection);
+            },
+          },
+        },
+        dispose: () => runtime.dispose(),
+      });
+    } catch (error) {
+      runtime.dispose();
+      throw error;
+    }
+    return spine;
+  }
+
+  #exportHostCheckpoint(): HostCheckpoint {
+    return {
+      sourceSeqs: [...this.#sourceSeqs], userNumbers: [...this.#userNumbers],
+      anchored: [...this.#anchored], anchorInText: [...this.#anchorInText], entered: [...this.#entered],
+      plan: this.#plan, projection: this.#projection,
+    };
+  }
+
+  #installCheckpoint(events: readonly SessionEvent[], host: HostCheckpoint): void {
+    for (const event of events) this.#events.set(event.seq, event);
+    for (const [id, seq] of host.sourceSeqs) {
+      this.#event(seq);
+      this.#sourceSeqs.set(id, seq);
+    }
+    for (const [seq, number] of host.userNumbers) {
+      if (!isUserSource(this.#event(seq)) || number !== this.#userNumbers.size + 1) {
+        throw new SpineDshError("Checkpoint user numbers do not match the log.");
+      }
+      this.#userNumbers.set(seq, number);
+    }
+    for (const seq of host.anchored) this.#anchored.add(seq);
+    for (const seq of host.anchorInText) this.#anchorInText.add(seq);
+    for (const producer of host.entered) this.#entered.add(producer);
+    for (const item of host.plan ?? []) if (item.type === "source") this.#event(item.seq);
+    this.#plan = host.plan;
+    this.#projection = host.projection;
+  }
+
+  /** Export a detached snapshot of a durable idle prefix without reserving the Agent. */
+  async saveCheckpoint(configToml: string, pluginSignal: AbortSignal): Promise<void> {
+    const { agent } = this;
+    const owner = AbortSignal.any([this.#checkpointLifetime.signal, pluginSignal]);
+    if (owner.aborted || agent.status !== "idle" || this.fault !== null || this.#recovering
+      || this.#recoveryPreview || this.#plan === null) return;
+    const events = agent.session.snapshotEvents();
+    const through = events.at(-1)?.seq;
+    if (through === undefined || !this.#checkpoint.needsUpdate(through)) return;
+    if ([...this.#userNumbers.keys()].some((seq) => !this.#anchored.has(seq))) return;
+    const sampling = this.#sampling;
+    const host = this.#exportHostCheckpoint();
+    let payload: { host: HostCheckpoint; sdk: string };
+    if (sampling === null) {
+      if (this.#unobserved.length !== 0) return;
+      payload = { host, sdk: await this.#runtime.exportCheckpoint() };
+    } else {
+      // Capture the pre-sampling SDK state before yielding to another step.
+      // Settle the final sampling on a separate runtime with the frozen tail,
+      // no tool execution, message writes or tree publication.
+      const end = events.findIndex((event) => event.seq === sampling.from);
+      if (end < 0 || !beginsSampling(events[end]!) || this.#unobserved.some((event) => event.seq < sampling.from)) return;
+      const tail = events.slice(end);
+      if (!tail.some((event) => event.type === "step/end") || tail.slice(1).some((event) =>
+        beginsSampling(event) || isUserSource(event) || arrivalOf(event) !== null
+        || pluginRecordOf(event)?.type === USER_ANCHORS
+        || (event.type === "session/end-seed" && event.data.inherited))) return;
+      const state = await this.#runtime.exportPreSamplingCheckpoint();
+      const shadow = await SpineAgent.#initialize(agent, agent.id, configToml, async () => {}, () => {});
+      try {
+        await shadow.#runtime.importCheckpoint(state);
+        shadow.#installCheckpoint(events.slice(0, end), host);
+        await shadow.#recover(tail, new Map(), owner);
+        if (shadow.#recoveryPreview) return;
+        payload = { host: shadow.#exportHostCheckpoint(), sdk: await shadow.#runtime.exportCheckpoint() };
+      } finally {
+        shadow.dispose();
+      }
+    }
+    owner.throwIfAborted();
+    if (await this.#checkpoint.flush() === false) return;
+    await this.#checkpoint.write(events, payload, owner);
   }
 
   get projection(): SpineProjection | null {
@@ -244,6 +366,7 @@ export class SpineAgent {
   }
 
   dispose(): void {
+    this.#checkpointLifetime.abort();
     this.#adapter.dispose();
   }
 
@@ -253,10 +376,15 @@ export class SpineAgent {
    * or at the end of the log. A forked session continues in its own
    * namespace where its inherited prefix ends.
    */
-  async #recover(events: readonly SessionEvent[], continuations: ReadonlyMap<number, string>): Promise<void> {
+  async #recover(events: readonly SessionEvent[], continuations: ReadonlyMap<number, string>, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
     const possibleLegacyAnchors: SessionSeq[] = [];
     this.#recovering = true;
-    for (const event of events) {
+    for (const [index, event] of events.entries()) {
+      // SDK calls can resolve without yielding to the host. Give a reload
+      // or shutdown a chance to cancel a long historical replay.
+      if (index > 0 && index % 128 === 0) await yieldToLoop();
+      signal.throwIfAborted();
       const sampling = beginsSampling(event);
       if (sampling) {
         // Older versions logged the anchor in the user text before sampling.
@@ -304,10 +432,13 @@ export class SpineAgent {
         });
       }
     }
+    signal.throwIfAborted();
     await this.settle();
+    signal.throwIfAborted();
     // Observe the entire recovery tail, including pending user sources, repaired
     // inline anchors and DSH's synthetic Fork results, before applying the plan.
-    await this.#guard(() => this.#prepare());
+    this.#recoveryPreview = this.#unobserved.length > 0;
+    if (this.#recoveryPreview) await this.#guard(() => this.#prepare());
     this.#recovering = false;
   }
 
@@ -335,6 +466,7 @@ export class SpineAgent {
   async #begin(from: number): Promise<void> {
     await this.#adapter.beginSampling();
     this.#sampling = { from, called: null };
+    this.#recoveryPreview = false;
   }
 
   /** Where the stretch of the sampling that began at `from` ends, as logged so far. */

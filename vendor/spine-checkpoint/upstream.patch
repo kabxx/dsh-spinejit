@@ -1,0 +1,534 @@
+diff --git a/crates/spine-core/src/compiler.rs b/crates/spine-core/src/compiler.rs
+index 5ad1985..867153f 100644
+--- a/crates/spine-core/src/compiler.rs
++++ b/crates/spine-core/src/compiler.rs
+@@ -16,7 +16,7 @@ pub const MAX_RAW_EVENT_BYTES: usize = 64 * 1024 * 1024;
+ pub const MAX_VISIBLE_CONTEXT_ITEMS: usize = 4096;
+ pub const MAX_TREE_NODES: usize = 4096;
+
+-#[derive(Clone, Debug)]
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+ // Compiler mutations are private and run only on caller-owned disposable candidates.
+ pub(crate) struct SpineCompiler {
+     config: SpineConfig,
+@@ -25,6 +25,10 @@ pub(crate) struct SpineCompiler {
+ }
+
+ impl SpineCompiler {
++    pub(crate) fn checkpoint_config(&self) -> &SpineConfig {
++        &self.config
++    }
++
+     pub(crate) fn new(config: SpineConfig) -> Result<Self, InitError> {
+         config.validate()?;
+         let reducer = SpineReducer::new();
+diff --git a/crates/spine-core/src/config.rs b/crates/spine-core/src/config.rs
+index de4c8e9..1b2d67c 100644
+--- a/crates/spine-core/src/config.rs
++++ b/crates/spine-core/src/config.rs
+@@ -28,7 +28,7 @@ pub const MAX_MODEL_VISIBLE_TEXT_BYTES: usize = 7 * 1024;
+ pub(crate) const MAX_TOOL_DESCRIPTION_BYTES: usize = 4 * 1024;
+ pub const DEFAULT_CONFIG_TOML: &str = include_str!("../config/spine.toml");
+
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+ pub enum Feature {
+     Jit,
+     Spawn,
+@@ -40,7 +40,7 @@ pub enum SpawnPromptMode {
+     Proactive,
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct SpineConfig {
+     jit_prompt: String,
+     node_prompt: String,
+@@ -57,7 +57,7 @@ impl Default for SpineConfig {
+     }
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ struct ToolDescriptions {
+     open: Option<String>,
+     close: Option<String>,
+diff --git a/crates/spine-core/src/context_char.rs b/crates/spine-core/src/context_char.rs
+index 0199f48..18f6d0a 100644
+--- a/crates/spine-core/src/context_char.rs
++++ b/crates/spine-core/src/context_char.rs
+@@ -11,7 +11,7 @@ use std::fmt;
+ ///
+ /// Every character corresponds to exactly one item in the host's live model
+ /// context. Zero-width observations are represented by [`SpineSignal`].
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub enum SpineChar {
+     Message(Message),
+     Opaque {
+@@ -62,7 +62,7 @@ impl SpineChar {
+     }
+ }
+
+-#[derive(Clone, Debug, Default, PartialEq, Eq)]
++#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct ParseStack {
+     cells: Vec<ParseCell>,
+ }
+@@ -85,7 +85,7 @@ impl ParseStack {
+     }
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct ParseCell {
+     id: CellId,
+     character: SpineChar,
+@@ -119,7 +119,7 @@ impl ParseCell {
+     }
+ }
+
+-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
++#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+ pub struct CellId(u64);
+
+ impl CellId {
+@@ -132,7 +132,7 @@ impl CellId {
+     }
+ }
+
+-#[derive(Clone, Debug, Default, PartialEq, Eq)]
++#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct SpineCharParser {
+     stack: ParseStack,
+     trailing_assistant: Vec<Message>,
+diff --git a/crates/spine-core/src/planner.rs b/crates/spine-core/src/planner.rs
+index b70f1da..697e16a 100644
+--- a/crates/spine-core/src/planner.rs
++++ b/crates/spine-core/src/planner.rs
+@@ -45,7 +45,7 @@ pub use types::PreparedSamplingCommit;
+ pub(crate) use types::RecoveredPlannerState;
+ pub use types::SamplingCommitOutput;
+
+-#[derive(Clone, Debug)]
++#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+ pub(crate) struct SamplingPlanner {
+     source: SourceLedger,
+     parser: SpineCharParser,
+@@ -62,6 +62,28 @@ pub(crate) struct SamplingPlanner {
+ }
+
+ impl SamplingPlanner {
++    pub(crate) fn validate_checkpoint(&self, thread: &ThreadNamespace, config: &SpineConfig) -> bool {
++        self.active_attempt.is_none()
++            && self.source.thread() == thread
++            && self.compiler.checkpoint_config() == config
++            && self.committed_source_cells <= self.source.cell_count()
++            && self.jit_enabled == config.is_enabled(Feature::Jit)
++            && self.spawn_enabled == config.is_enabled(Feature::Spawn)
++    }
++
++    pub(crate) fn checkpoint_before_attempt(
++        &self,
++        attempt_id: &SamplingAttemptId,
++        pre_boundary: &BoundaryId,
++    ) -> Option<Self> {
++        if self.active_attempt.as_ref() != Some(attempt_id) || &self.current_boundary() != pre_boundary {
++            return None;
++        }
++        let mut planner = self.clone();
++        planner.active_attempt = None;
++        Some(planner)
++    }
++
+     pub fn new(
+         thread: ThreadNamespace,
+         epoch: ContextEpoch,
+diff --git a/crates/spine-core/src/pressure.rs b/crates/spine-core/src/pressure.rs
+index 1285781..a2497f3 100644
+--- a/crates/spine-core/src/pressure.rs
++++ b/crates/spine-core/src/pressure.rs
+@@ -4,7 +4,7 @@ use crate::SpineOperationFact;
+ ///
+ /// A host supplies the input tokens reported for each completed sampling. Open
+ /// checkpoints that value; Close restores it after the node suffix is replaced.
+-#[derive(Clone, Debug, Default, PartialEq, Eq)]
++#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub(crate) struct InputPressureState {
+     current: Option<u64>,
+     open_checkpoints: Vec<Option<u64>>,
+diff --git a/crates/spine-core/src/reducer.rs b/crates/spine-core/src/reducer.rs
+index 21b1501..b12f9f8 100644
+--- a/crates/spine-core/src/reducer.rs
++++ b/crates/spine-core/src/reducer.rs
+@@ -22,7 +22,7 @@ use crate::SpineProjection;
+ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ enum NodeEntry {
+     Leaf(ContextItem),
+     Child(NodeId),
+@@ -32,7 +32,7 @@ enum NodeEntry {
+     Reply(Message),
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ struct RuntimeNode {
+     id: NodeId,
+     parent: Option<NodeId>,
+@@ -78,7 +78,7 @@ impl RuntimeNode {
+     }
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub(crate) struct SpineReducer {
+     nodes: Vec<RuntimeNode>,
+     current_root: NodeId,
+@@ -86,6 +86,7 @@ pub(crate) struct SpineReducer {
+     baseline: Vec<ContextItem>,
+     next_user_anchor: u64,
+     /// Every admitted arrival, by producer.
++    #[serde(with = "checkpoint_arrivals")]
+     arrivals: BTreeMap<NodeId, SpawnArrival>,
+     /// Births unarrived when this namespace continued an earlier one.
+     inherited: BTreeSet<NodeId>,
+@@ -102,6 +103,27 @@ pub(crate) struct SpineReducer {
+     follows_fold: Vec<RawSpan>,
+ }
+
++// JSON cannot directly represent a map whose keys are NodeId vectors.
++mod checkpoint_arrivals {
++    use super::{BTreeMap, NodeId, SpawnArrival};
++    use serde::{Deserialize, Deserializer, Serialize, Serializer};
++
++    pub fn serialize<S: Serializer>(map: &BTreeMap<NodeId, SpawnArrival>, serializer: S) -> Result<S::Ok, S::Error> {
++        map.iter().collect::<Vec<_>>().serialize(serializer)
++    }
++
++    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<NodeId, SpawnArrival>, D::Error> {
++        let pairs = Vec::<(NodeId, SpawnArrival)>::deserialize(deserializer)?;
++        let mut map = BTreeMap::new();
++        for (node, arrival) in pairs {
++            if node != arrival.producer || map.insert(node, arrival).is_some() {
++                return Err(serde::de::Error::custom("invalid checkpoint arrival entry"));
++            }
++        }
++        Ok(map)
++    }
++}
++
+ impl Default for SpineReducer {
+     fn default() -> Self {
+         Self::new()
+diff --git a/crates/spine-core/src/sampling_runtime.rs b/crates/spine-core/src/sampling_runtime.rs
+index 098142d..437baf5 100644
+--- a/crates/spine-core/src/sampling_runtime.rs
++++ b/crates/spine-core/src/sampling_runtime.rs
+@@ -50,6 +50,25 @@ impl SamplingTerminal {
+     }
+ }
+
++const CHECKPOINT_SCHEMA: &str = "spine.sampling.checkpoint.v1-69059e0";
++
++#[derive(serde::Serialize)]
++struct CheckpointRef<'a> {
++    schema: &'static str,
++    planner: &'a SamplingPlanner,
++    next_attempt: u64,
++    next_commit: u64,
++}
++
++#[derive(serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Checkpoint {
++    schema: String,
++    planner: SamplingPlanner,
++    next_attempt: u64,
++    next_commit: u64,
++}
++
+ pub enum SamplingFinish {
+     OrphanedStart,
+     Prepared(PreparedSamplingCommit),
+@@ -79,6 +98,79 @@ struct PendingSamplingExecution {
+ }
+
+ impl SamplingRuntime {
++    /// Export the established state at a settled transaction boundary.
++    pub fn export_checkpoint(&self) -> Result<String, String> {
++        if !matches!(self.state, SamplingRuntimeState::Idle) {
++            return Err("checkpoint requires an idle sampling runtime".to_string());
++        }
++        Self::encode_checkpoint(&self.planner, self.next_attempt, self.next_commit)
++    }
++
++    /// Return the state immediately before an untouched sampling started.
++    /// The host can replay the logged sampling in a fresh runtime without
++    /// advancing or sealing the live runtime.
++    pub fn export_pre_sampling_checkpoint(&self) -> Result<String, String> {
++        let SamplingRuntimeState::Active(active) = &self.state else {
++            return Err("pre-sampling checkpoint requires an active sampling".to_string());
++        };
++        if !active.started || active.next_execution != 0 || !active.pending.is_empty() {
++            return Err(
++                "pre-sampling checkpoint requires a sampling without executions".to_string(),
++            );
++        }
++        let planner = self
++            .planner
++            .checkpoint_before_attempt(&active.attempt_id, &active.pre_boundary)
++            .ok_or_else(|| "pre-sampling checkpoint requires unchanged sources".to_string())?;
++        let next_attempt = self
++            .next_attempt
++            .checked_sub(1)
++            .filter(|_| self.next_attempt != u64::MAX)
++            .ok_or_else(|| {
++                "pre-sampling checkpoint cannot recover the attempt ordinal".to_string()
++            })?;
++        Self::encode_checkpoint(&planner, next_attempt, self.next_commit)
++    }
++
++    fn encode_checkpoint(
++        planner: &SamplingPlanner,
++        next_attempt: u64,
++        next_commit: u64,
++    ) -> Result<String, String> {
++        serde_json::to_string(&CheckpointRef {
++            schema: CHECKPOINT_SCHEMA,
++            planner,
++            next_attempt,
++            next_commit,
++        })
++        .map_err(|error| error.to_string())
++    }
++
++    /// Restore an authenticated cache derived from the matching host log.
++    /// The host owns log-prefix validation and handles full replay on a miss.
++    pub fn import_checkpoint(
++        state: &str,
++        thread: &ThreadNamespace,
++        config: &SpineConfig,
++    ) -> Result<Self, String> {
++        let checkpoint: Checkpoint =
++            serde_json::from_str(state).map_err(|error| error.to_string())?;
++        if checkpoint.schema != CHECKPOINT_SCHEMA {
++            return Err("checkpoint schema does not match this core build".to_string());
++        }
++        if !checkpoint.planner.validate_checkpoint(thread, config) {
++            return Err(
++                "checkpoint does not match the runtime namespace, configuration or boundary"
++                    .to_string(),
++            );
++        }
++        Ok(Self::from_replay(
++            checkpoint.planner,
++            checkpoint.next_attempt,
++            checkpoint.next_commit,
++        ))
++    }
++
+     pub fn new(
+         thread: ThreadNamespace,
+         epoch: ContextEpoch,
+diff --git a/crates/spine-core/src/source_ledger.rs b/crates/spine-core/src/source_ledger.rs
+index a3b727a..d76918e 100644
+--- a/crates/spine-core/src/source_ledger.rs
++++ b/crates/spine-core/src/source_ledger.rs
+@@ -12,7 +12,7 @@ use crate::context_plan::ContextPlanSource;
+ use serde::Serialize;
+ use thiserror::Error;
+
+-#[derive(Clone, Debug, PartialEq, Eq)]
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+ pub struct SourceLedger {
+     thread: ThreadNamespace,
+     epoch: ContextEpoch,
+@@ -28,7 +28,7 @@ pub struct SourceSnapshot {
+     cells: Vec<SourceCell>,
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+ pub struct SourceCell {
+     pub id: SourceCellId,
+     pub boundary: BoundaryId,
+@@ -36,7 +36,7 @@ pub struct SourceCell {
+     pub item: ContextItem,
+ }
+
+-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ pub enum SourceCellPayload {
+     Message(Message),
+@@ -68,6 +68,10 @@ pub enum SourceLedgerError {
+ }
+
+ impl SourceLedger {
++    pub(crate) fn cell_count(&self) -> usize {
++        self.cells.len()
++    }
++
+     pub fn new(thread: ThreadNamespace, epoch: ContextEpoch) -> Result<Self, SourceLedgerError> {
+         Ok(Self {
+             thread,
+diff --git a/crates/spine-wasm/src/dto.rs b/crates/spine-wasm/src/dto.rs
+index a0c4877..273d7af 100644
+--- a/crates/spine-wasm/src/dto.rs
++++ b/crates/spine-wasm/src/dto.rs
+@@ -85,6 +85,11 @@ pub enum Command {
+     },
+     Preview,
+     SourceSnapshot,
++    ExportCheckpoint,
++    ExportPreSamplingCheckpoint,
++    ImportCheckpoint {
++        state: String,
++    },
+     ContinueNamespace {
+         thread: String,
+     },
+@@ -210,6 +215,10 @@ pub enum CommandResult {
+     SourceSnapshot {
+         source: PortableSourceSnapshot,
+     },
++    CheckpointExported {
++        state: String,
++    },
++    CheckpointImported,
+     NamespaceContinued {
+         source: PortableSourceSnapshot,
+     },
+diff --git a/crates/spine-wasm/src/runtime.rs b/crates/spine-wasm/src/runtime.rs
+index 012c23f..b5f931d 100644
+--- a/crates/spine-wasm/src/runtime.rs
++++ b/crates/spine-wasm/src/runtime.rs
+@@ -25,6 +25,22 @@ use spine_core::host::ThreadNamespace;
+ use std::fmt;
+
+ const MAX_ABI_REQUEST_BYTES: usize = 4 * 1024 * 1024;
++const MAX_CHECKPOINT_BYTES: usize = 64 * 1024 * 1024;
++// Escaping the opaque JSON string can expand it in the outer envelope.
++const MAX_CHECKPOINT_REQUEST_BYTES: usize = 128 * 1024 * 1024;
++
++#[derive(serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++struct CheckpointImportEnvelope {
++    schema: String,
++    request: CheckpointImportCommand,
++}
++
++#[derive(serde::Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
++enum CheckpointImportCommand {
++    ImportCheckpoint { state: String },
++}
+
+ pub struct PortableRuntime {
+     thread: ThreadNamespace,
+@@ -177,6 +193,38 @@ impl PortableRuntime {
+             Command::SourceSnapshot => Ok(CommandResult::SourceSnapshot {
+                 source: self.source_snapshot(),
+             }),
++            Command::ExportCheckpoint | Command::ExportPreSamplingCheckpoint => {
++                let state = match command {
++                    Command::ExportCheckpoint => {
++                        self.require_idle()?;
++                        self.runtime.export_checkpoint()
++                    }
++                    _ => {
++                        self.require_sampling()?;
++                        self.runtime.export_pre_sampling_checkpoint()
++                    }
++                }
++                .map_err(BindingError::state)?;
++                if state.len() > MAX_CHECKPOINT_BYTES {
++                    return Err(BindingError::input(
++                        "checkpoint exceeds the cache state size limit",
++                    ));
++                }
++                Ok(CommandResult::CheckpointExported { state })
++            }
++            Command::ImportCheckpoint { state } => {
++                self.require_idle()?;
++                if state.len() > MAX_CHECKPOINT_BYTES {
++                    return Err(BindingError::input(
++                        "checkpoint exceeds the cache state size limit",
++                    ));
++                }
++                let restored =
++                    SamplingRuntime::import_checkpoint(&state, &self.thread, &self.config)
++                        .map_err(BindingError::input)?;
++                self.runtime = restored;
++                Ok(CommandResult::CheckpointImported)
++            }
+             Command::ContinueNamespace { thread } => {
+                 let thread = ThreadNamespace::parse(thread).map_err(BindingError::input)?;
+                 self.runtime
+@@ -195,14 +243,10 @@ impl PortableRuntime {
+     }
+
+     pub fn dispatch_json(&mut self, request_json: &str) -> String {
+-        let result = require_bounded_request(request_json)
+-            .and_then(|()| {
+-                serde_json::from_str::<CommandRequest>(request_json).map_err(BindingError::json)
+-            })
+-            .and_then(|request| {
+-                require_schema(&request.schema)?;
+-                self.execute(request.request)
+-            });
++        let result = decode_request(request_json).and_then(|request| {
++            require_schema(&request.schema)?;
++            self.execute(request.request)
++        });
+         match result {
+             Ok(result) => encode(&SuccessEnvelope {
+                 schema: ABI_SCHEMA,
+@@ -325,15 +369,9 @@ impl PortableRuntime {
+         Ok(CommandResult::PreparedDiscarded { transaction_id })
+     }
+
+-    fn compact(
+-        &mut self,
+-        barrier: SpineCompactBarrierV1,
+-    ) -> Result<CommandResult, BindingError> {
++    fn compact(&mut self, barrier: SpineCompactBarrierV1) -> Result<CommandResult, BindingError> {
+         self.require_idle()?;
+-        let projection = self
+-            .runtime
+-            .compact(barrier)
+-            .map_err(BindingError::core)?;
++        let projection = self.runtime.compact(barrier).map_err(BindingError::core)?;
+         let context_plan = self
+             .runtime
+             .preview_context_plan()
+@@ -505,6 +543,25 @@ fn require_schema(schema: &str) -> Result<(), BindingError> {
+     }
+ }
+
++fn decode_request(json: &str) -> Result<CommandRequest, BindingError> {
++    if json.len() <= MAX_ABI_REQUEST_BYTES {
++        return serde_json::from_str(json).map_err(BindingError::json);
++    }
++    if json.len() <= MAX_CHECKPOINT_REQUEST_BYTES
++        && let Ok(CheckpointImportEnvelope {
++            schema,
++            request: CheckpointImportCommand::ImportCheckpoint { state },
++        }) = serde_json::from_str(json)
++    {
++        return Ok(CommandRequest {
++            schema,
++            request: Command::ImportCheckpoint { state },
++        });
++    }
++    require_bounded_request(json)?;
++    unreachable!("only oversized requests reach this point")
++}
++
+ fn require_bounded_request(value: &str) -> Result<(), BindingError> {
+     if value.len() <= MAX_ABI_REQUEST_BYTES {
+         Ok(())

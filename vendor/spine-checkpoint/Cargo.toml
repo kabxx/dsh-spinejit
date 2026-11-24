@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/spine-core", "crates/spine-wasm"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.95"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+spine-core = { path = "crates/spine-core" }
+thiserror = "2.0.17"
+wasm-bindgen = "=0.2.129"
+toml = "0.9.5"
+pretty_assertions = "1.4.1"
+
+[workspace.lints.rust]
