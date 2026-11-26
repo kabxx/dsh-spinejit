@@ -19,6 +19,7 @@ export declare const treeProjection: {
     init: () => SpineTree | null;
     apply(state: SpineTree | null, event: SessionEvent): SpineTree | null;
     wire: {
+        summary: boolean;
         viewSchema: z.ZodNullable<z.ZodType<SpineTree, unknown, z.core.$ZodTypeInternals<SpineTree, unknown>>>;
         view: (state: SpineTree | null) => SpineTree | null;
     };

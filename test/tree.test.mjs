@@ -105,6 +105,8 @@ test("the projection folds the latest readable tree record and ignores the rest"
   assert.equal(treeProjection.apply(folded, other), folded, "an unrelated event keeps the same state");
   assert.equal(treeProjection.apply(folded, record(3, { cursor: 1 })), folded, "an unreadable record keeps the tree");
   assert.deepEqual(treeProjection.wire.viewSchema.parse(folded), deep);
+  assert.equal(treeProjection.wire.summary, false, "session/list summaries omit the display-only tree");
+  assert.deepEqual(treeProjection.wire.view(folded), deep, "SpineDock still receives the complete projection");
 });
 
 test("each change of the shown tree is recorded once, a resumed session records none again, and the projection serves it", async () => {
@@ -125,6 +127,9 @@ test("each change of the shown tree is recorded once, a resumed session records 
       ["  └ ✓ inspect"],
     ]);
     assert.deepEqual(first.ctx.sessionProjections.stateOf(agent.session, "spinejit"), trees.at(-1));
+    const summary = first.ctx.sessionProjections.snapshot(agent.session, first.ctx.sessionProjections.summaryKeys());
+    assert.equal("spinejit" in summary.values, false, "session/list summaries omit the tree");
+    assert.deepEqual(first.ctx.sessionProjections.snapshot(agent.session).values.spinejit, trees.at(-1), "full client snapshots retain the tree for SpineDock");
   } finally {
     await first.dispose();
   }
