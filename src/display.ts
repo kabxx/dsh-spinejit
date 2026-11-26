@@ -48,7 +48,7 @@ export const treeProjection = {
     const tree = treeSchema.safeParse(record.data);
     return tree.success ? tree.data : state;
   },
-  wire: { viewSchema: stateSchema, view: (state: SpineTree | null): SpineTree | null => state },
+  wire: { summary: false, viewSchema: stateSchema, view: (state: SpineTree | null): SpineTree | null => state },
 };
 
 /**
